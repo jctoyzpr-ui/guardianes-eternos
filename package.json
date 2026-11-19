@@ -1,0 +1,25 @@
+{
+  "name": "guardianes-eternos",
+  "version": "1.0.0",
+  "description": "Eternal Guardians — Swarm Cyber Deception, AI Tarpit & Defensive Indirect Prompt Injection Framework (MIT Open Source)",
+  "main": "src/server.js",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/guardianes.test.js"
+  },
+  "keywords": [
+    "cybersecurity",
+    "deception",
+    "honeypot",
+    "tarpit",
+    "prompt-injection",
+    "swarm-defense",
+    "zero-trust",
+    "ai-security"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

@@ -1,0 +1,19 @@
+# Secretos, bases de datos locales y llaves cifradas (NUNCA subir a GitHub)
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.key
+.vault.key
+
+# Variables de entorno
+.env
+.env.*
+
+# Dependencias y logs
+node_modules/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
