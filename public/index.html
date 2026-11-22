@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Guardianes Eternos v3.0 — Enterprise SOC · OpenRouter · WAF &amp; Cyber Deception</title>
+  <title>Guardianes Eternos v5.0 — Holographic 3D SOC · Dual-Plane WAF &amp; Cyber Deception</title>
   <style>
     :root {
       --bg-void: #050810;
@@ -35,6 +35,31 @@
       line-height: 1.45;
       overflow-x: hidden;
     }
+
+    /* Admin Login Gate */
+    .auth-gate {
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(circle at 50% 35%, #0c1931 0%, #050810 70%);
+      display: none;
+      place-items: center;
+      z-index: 200;
+      padding: 20px;
+    }
+    .auth-gate.open { display: grid; }
+    .auth-card {
+      width: 100%;
+      max-width: 440px;
+      background: rgba(14, 21, 38, 0.96);
+      border: 1px solid rgba(34, 211, 238, 0.4);
+      border-radius: 16px;
+      padding: 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+    }
+    .auth-error { color: #fca5a5; font-size: 0.8rem; min-height: 18px; }
 
     /* App Shell */
     .app-shell {
@@ -255,6 +280,56 @@
     .kpi-value { font-size: 1.65rem; font-weight: 800; font-family: var(--font-mono); margin: 4px 0 2px; }
     .kpi-foot { font-size: 0.75rem; color: var(--text-secondary); }
 
+    /* 3D Holographic SOC Viewport */
+    .soc3d-card {
+      background: var(--bg-surface);
+      border: 1px solid rgba(34, 211, 238, 0.35);
+      border-radius: 14px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .soc3d-stage-wrap {
+      position: relative;
+      width: 100%;
+      height: 430px;
+      border-radius: 11px;
+      overflow: hidden;
+      background: radial-gradient(circle at center, #081529 0%, #040812 75%);
+      border: 1px solid var(--border);
+    }
+    #soc3d-canvas-host { width: 100%; height: 100%; }
+    .soc3d-hud-tl {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(7, 11, 21, 0.86);
+      border: 1px solid rgba(34, 211, 238, 0.35);
+      border-radius: 9px;
+      padding: 8px 12px;
+      font-size: 0.74rem;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      pointer-events: none;
+    }
+    .soc3d-hud-br {
+      position: absolute;
+      bottom: 12px;
+      right: 12px;
+      background: rgba(7, 11, 21, 0.9);
+      border: 1px solid rgba(239, 68, 68, 0.45);
+      border-radius: 9px;
+      padding: 10px 13px;
+      max-width: 310px;
+      font-size: 0.76rem;
+      display: none;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .soc3d-hud-br.open { display: flex; }
+
     /* Agent Cards with Direct Model Designation */
     .agents-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 12px; }
     .agent-card {
@@ -283,14 +358,7 @@
     .agent-assign-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
     .agent-custom-row { display: flex; gap: 6px; }
 
-    /* Live SVG Topology Map */
-    .topology-card {
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px;
-    }
-    .topology-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+    /* Live SVG Topology Map (2D Fallback / Classic Toggle) */
     .topology-svg-wrap {
       width: 100%;
       overflow-x: auto;
@@ -387,12 +455,8 @@
     .small { font-size: 0.77rem; color: var(--text-secondary); }
     .tag-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 
-    /* Cyber Range Battle View (Remotion-ready) */
-    .range-banner {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 14px;
-    }
+    /* Cyber Range Battle View */
+    .range-banner { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
     @media (max-width: 900px) { .range-banner { grid-template-columns: 1fr; } }
     .range-summary-box {
       border-radius: 12px;
@@ -420,11 +484,7 @@
       flex-direction: column;
       gap: 10px;
     }
-    .range-cols {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-    }
+    .range-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     @media (max-width: 900px) { .range-cols { grid-template-columns: 1fr; } }
     .range-col {
       background: var(--bg-input);
@@ -490,6 +550,16 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .hermes-pending-box {
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.45);
+      border-radius: 10px;
+      padding: 11px 13px;
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .hermes-pending-box.open { display: flex; }
     .hermes-tools-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
     .hermes-input-bar { display: flex; gap: 8px; }
 
@@ -502,6 +572,33 @@
   </style>
 </head>
 <body>
+  <!-- Mandatory Admin Auth Gate (C-01 & C-02) -->
+  <div class="auth-gate" id="auth-gate">
+    <div class="auth-card">
+      <div style="display:flex;align-items:center;gap:12px;">
+        <div class="shield-logo">🛡️</div>
+        <div>
+          <div class="brand-title">GUARDIANES ETERNOS v5.0</div>
+          <div class="brand-ver">CONTROL PLANE · AUTH + CSRF OBLIGATORIA</div>
+        </div>
+      </div>
+      <div class="small">
+        Introduce el <code>GUARDIANES_ADMIN_TOKEN</code> configurado al iniciar el servidor. La sesión se firma en cookie <code>HttpOnly; SameSite=Strict</code> con protección <code>X-CSRF-Token</code>.
+      </div>
+      <div class="field" style="margin-bottom:0;">
+        <label for="login-token-input">Admin Token</label>
+        <input
+          type="password"
+          id="login-token-input"
+          placeholder="Pega tu GUARDIANES_ADMIN_TOKEN..."
+          onkeydown="if (event.key === 'Enter') submitAdminLogin();"
+        />
+      </div>
+      <div class="auth-error" id="login-error"></div>
+      <button class="primary" id="btn-admin-login" onclick="submitAdminLogin()">🔐 Iniciar Sesión en el SOC</button>
+    </div>
+  </div>
+
   <div class="app-shell">
     <!-- Sidebar Navigation -->
     <aside class="sidebar">
@@ -509,18 +606,18 @@
         <div class="shield-logo">🛡️</div>
         <div>
           <div class="brand-title">GUARDIANES ETERNOS</div>
-          <div class="brand-ver">v4.0 HERMES SOC · MIT</div>
+          <div class="brand-ver">v5.0 DUAL-PLANE 3D · MIT</div>
         </div>
       </div>
 
       <div class="nav-group">
         <div class="nav-label">Operaciones SOC</div>
-        <button class="nav-btn active" id="nav-soc" onclick="switchView('view-soc', this)">📡 Centro Operativo &amp; Topología</button>
-        <button class="nav-btn" id="nav-hermes" onclick="switchView('view-hermes', this)">⚡ Comandante Hermes (Chat IA)</button>
+        <button class="nav-btn active" id="nav-soc" onclick="switchView('view-soc', this)">🌐 SOC Holográfico 3D &amp; Enjambre</button>
+        <button class="nav-btn" id="nav-hermes" onclick="switchView('view-hermes', this)">⚡ Comandante Hermes (2-Step)</button>
         <button class="nav-btn" id="nav-range" onclick="switchView('view-range', this)">⚔️ Campo de Tiro (Prueba Real)</button>
         <button class="nav-btn" id="nav-agents" onclick="switchView('view-agents', this)">🤖 Agentes, OpenRouter &amp; BYOK</button>
-        <button class="nav-btn" id="nav-shield" onclick="switchView('view-shield', this)">🛡️ Escudo WAF, Deploy &amp; Firewalls</button>
-        <button class="nav-btn" id="nav-reports" onclick="switchView('view-reports', this)">📜 Reportes &amp; 42 Cebos Canario</button>
+        <button class="nav-btn" id="nav-shield" onclick="switchView('view-shield', this)">🛡️ Escudo WAF, Nginx Sidecar &amp; Firewalls</button>
+        <button class="nav-btn" id="nav-reports" onclick="switchView('view-reports', this)">📜 Reportes &amp; 43+ Cebos Canario</button>
       </div>
 
       <button class="sidebar-cta" onclick="focusOpenRouterKey()">
@@ -528,10 +625,14 @@
       </button>
 
       <div class="health-box">
-        <div class="nav-label" style="padding:0;margin-bottom:4px;">Telemetría del Sistema</div>
+        <div class="nav-label" style="padding:0;margin-bottom:4px;">Telemetría Dual-Plane</div>
         <div class="health-row">
-          <span>Motor Persistencia</span>
-          <span class="mono" style="color:var(--emerald);" id="sb-sqlite"><span class="dot green"></span> SQLite WAL</span>
+          <span>Stream SSE en vivo</span>
+          <span class="mono" style="color:var(--emerald);" id="sb-sse"><span class="dot green"></span> Conectando</span>
+        </div>
+        <div class="health-row">
+          <span>Sockets Tarpit</span>
+          <span class="mono" id="sb-tarpit" style="color:var(--cyan);">0 / 1000</span>
         </div>
         <div class="health-row">
           <span>OpenRouter API</span>
@@ -539,12 +640,13 @@
         </div>
         <div class="health-row">
           <span>Modo Enjambre</span>
-          <span class="mono" id="sb-mode" style="color:var(--cyan);">ESPECIALIZADO</span>
+          <span class="mono" id="sb-mode" style="color:var(--cyan);">POR AGENTE</span>
         </div>
         <div class="health-row">
           <span>Escudo Presupuesto</span>
           <span class="mono" id="sb-budget">0 / 50 API/h</span>
         </div>
+        <button class="mini danger" style="margin-top:4px;justify-content:center;" onclick="logoutAdmin()">🚪 Cerrar Sesión</button>
       </div>
     </aside>
 
@@ -554,13 +656,13 @@
       <header class="topbar">
         <div class="topbar-left">
           <h2>
-            Centro de Mando Defensivo
-            <span class="pill emerald">● PROTECCIÓN ACTIVA</span>
-            <span class="pill cyan" id="badge-persistence">sqlite-disk + WAF DPI + Byte-Drip</span>
+            Centro de Mando Defensivo v5.0
+            <span class="pill emerald">● DUAL-PLANE ACTIVO</span>
+            <span class="pill cyan" id="badge-persistence">SQLite Batched + WAF DPI + Tarpit</span>
           </h2>
           <div class="topbar-meta">
-            <span>Dominio objetivo: <strong id="badge-target" style="color:var(--text-primary);">https://www.365collaboration.net</strong></span>
-            <span class="pill violet">365 Collaboration</span>
+            <span>Objetivo: <strong id="badge-target" style="color:var(--text-primary);">https://www.365collaboration.net</strong></span>
+            <span class="pill violet">Capa Decepción + Canarios (Complemento Cloudflare / OWASP CRS)</span>
           </div>
         </div>
         <div class="actions">
@@ -573,14 +675,14 @@
         </div>
       </header>
 
-      <!-- VIEW 1: Main SOC Dashboard -->
+      <!-- VIEW 1: Main SOC Dashboard + 3D Holographic Viewport -->
       <section id="view-soc" class="view-panel active">
-        <!-- Quick OpenRouter & Swarm Mode Ribbon (Right in Front!) -->
+        <!-- Quick OpenRouter & Swarm Mode Ribbon -->
         <div class="openrouter-bar">
           <div class="or-left">
             <div>
               <strong style="font-size:0.88rem;color:#e9d5ff;">⚡ OpenRouter Unified Key</strong>
-              <div class="small" id="or-quick-status">Pega tu llave sk-or-v1-... para asignar cualquier modelo a tus Guardianes</div>
+              <div class="small" id="or-quick-status">Pega tu llave sk-or-v1-... para asignar modelos a tus Guardianes</div>
             </div>
             <div class="or-input-group">
               <input type="password" id="quick-openrouter-key" placeholder="sk-or-v1-... (pega tu OpenRouter API Key)" />
@@ -599,19 +701,19 @@
         <!-- KPI Metrics -->
         <div class="kpi-grid">
           <div class="kpi-card">
-            <div class="kpi-label">Intrusos &amp; Cuarentenas</div>
+            <div class="kpi-label">Intrusos &amp; Cuarentenas (Persistentes)</div>
             <div class="kpi-value" id="kpi-threats" style="color:var(--crimson);">0</div>
             <div class="kpi-foot" id="kpi-hits-sub">0 golpes bloqueados · 0 en cuarentena</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">Nodos Laberinto &amp; IDPI</div>
+            <div class="kpi-label">Nodos Laberinto &amp; Tarpit Sockets</div>
             <div class="kpi-value" id="kpi-nodes" style="color:var(--cyan);">0</div>
-            <div class="kpi-foot" id="kpi-traps-sub">0 trampas System Prompt activas</div>
+            <div class="kpi-foot" id="kpi-traps-sub">0 trampas IDPI · 0 sockets tarpit en uso</div>
           </div>
           <div class="kpi-card">
-            <div class="kpi-label">Tokens Quemados al Atacante</div>
+            <div class="kpi-label">Tokens Atacante (Estimado)</div>
             <div class="kpi-value" id="kpi-attacker-tokens" style="color:var(--amber);">0</div>
-            <div class="kpi-foot" id="kpi-attacker-cost">Costo drenado al hacker: ~$0.0000 USD</div>
+            <div class="kpi-foot" id="kpi-attacker-cost">Costo estimado drenado: ~$0.0000 USD</div>
           </div>
           <div class="kpi-card">
             <div class="kpi-label">Gasto de Nuestra Defensa</div>
@@ -620,15 +722,81 @@
           </div>
         </div>
 
+        <!-- 3D Holographic SOC + 2D Toggle -->
+        <div class="soc3d-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+            <div class="tag-row">
+              <strong style="font-size:0.95rem;">🌐 SOC Holográfico 3D — Enjambre Orbital &amp; Vórtice Polar Tarpit</strong>
+              <span class="pill cyan" id="badge-3d-engine">Cargando Three.js...</span>
+            </div>
+            <div class="tag-row">
+              <button class="mini primary" id="btn-view-3d" onclick="setTopologyMode('3d')">🧊 Vista 3D Holográfica</button>
+              <button class="mini" id="btn-view-2d" onclick="setTopologyMode('2d')">🗺️ Vista 2D Clásica</button>
+            </div>
+          </div>
+
+          <div class="soc3d-stage-wrap" id="soc3d-stage-wrap">
+            <div id="soc3d-canvas-host"></div>
+            <div class="soc3d-hud-tl">
+              <div style="color:var(--cyan);font-weight:700;">🛰️ TELEMETRÍA EN VIVO (SSE)</div>
+              <div class="mono" id="hud-3d-legit" style="color:var(--emerald);">Tráfico limpio: 0 req</div>
+              <div class="mono" id="hud-3d-trapped" style="color:var(--crimson);">Vórtice Tarpit: 0 intrusos</div>
+              <div class="mono" id="hud-3d-sockets" style="color:var(--amber);">Sockets Tarpit: 0 / 1000</div>
+              <div style="color:var(--text-secondary);font-size:0.69rem;">Arrastra para orbitar · Clic en un nodo rojo para inspeccionar</div>
+            </div>
+            <div class="soc3d-hud-br" id="soc3d-selected-hud">
+              <div style="display:flex;justify-content:space-between;align-items:center;">
+                <strong style="color:#fca5a5;" id="hud-sel-title">Expediente 3D</strong>
+                <button class="mini" onclick="document.getElementById('soc3d-selected-hud').classList.remove('open')">✕</button>
+              </div>
+              <div class="mono" id="hud-sel-meta" style="color:var(--cyan);font-size:0.72rem;"></div>
+              <div id="hud-sel-vectors" class="small"></div>
+            </div>
+          </div>
+
+          <!-- Classic 2D SVG Topology (hidden by default, toggleable) -->
+          <div class="topology-svg-wrap" id="topo-2d-wrap" style="display:none;">
+            <svg class="topo-svg" viewBox="0 0 1000 225" xmlns="http://www.w3.org/2000/svg">
+              <path d="M 155 112 L 245 112" stroke="#3b82f6" stroke-width="2.5" />
+              <path d="M 465 90 C 535 55, 625 48, 725 48" class="flow-clean" />
+              <path d="M 465 135 C 515 165, 540 168, 575 168" class="flow-hostile" />
+              <path d="M 735 168 L 785 168" class="flow-deception" />
+              <rect x="15" y="74" width="140" height="76" rx="10" fill="#10182b" stroke="#3b82f6" stroke-width="1.5" />
+              <text x="85" y="102" fill="#eef4ff" font-size="12" font-weight="700" text-anchor="middle">🌐 Tráfico HTTP</text>
+              <text x="85" y="122" fill="#8ea3c9" font-size="10" text-anchor="middle" font-family="monospace">Data Plane :4040</text>
+              <text x="85" y="138" fill="#22d3ee" font-size="10" text-anchor="middle" font-family="monospace" id="svg-ingress-count">0 legítimas</text>
+
+              <rect x="245" y="62" width="220" height="100" rx="12" fill="#111d36" stroke="#10b981" stroke-width="2" />
+              <text x="355" y="92" fill="#10b981" font-size="13" font-weight="800" text-anchor="middle">👁️ CENTINELA WAF v5</text>
+              <text x="355" y="112" fill="#eef4ff" font-size="10" text-anchor="middle">43+ Canarios · DPI + SSRF BlockList</text>
+              <text x="355" y="130" fill="#f59e0b" font-size="10" text-anchor="middle" font-family="monospace" id="svg-threats-count">0 bloqueados</text>
+              <text x="355" y="148" fill="#8ea3c9" font-size="8.5" text-anchor="middle" font-family="monospace" id="svg-sentinel-model">local</text>
+
+              <rect x="725" y="14" width="245" height="68" rx="10" fill="#0c221d" stroke="#10b981" stroke-width="1.6" />
+              <text x="847" y="40" fill="#10b981" font-size="12" font-weight="700" text-anchor="middle">✅ Aplicación Real Protegida</text>
+              <text x="847" y="60" fill="#cbd5e1" font-size="10" text-anchor="middle" font-family="monospace" id="svg-target-domain">365collaboration.net</text>
+
+              <rect x="575" y="124" width="160" height="86" rx="10" fill="#23121c" stroke="#ef4444" stroke-width="1.8" />
+              <text x="655" y="150" fill="#fca5a5" font-size="12" font-weight="700" text-anchor="middle">🕸️ TEJEDOR TARPIT</text>
+              <text x="655" y="169" fill="#e2e8f0" font-size="10" text-anchor="middle">Byte-Drip ($0.00)</text>
+              <text x="655" y="188" fill="#22d3ee" font-size="10" text-anchor="middle" font-family="monospace" id="svg-nodes-count">0 nodos falsos</text>
+
+              <rect x="785" y="124" width="195" height="86" rx="10" fill="#1a1533" stroke="#a78bfa" stroke-width="1.8" />
+              <text x="882" y="150" fill="#ddd6fe" font-size="12" font-weight="700" text-anchor="middle">🎭 ILUSIONISTA + 📜 CRONISTA</text>
+              <text x="882" y="169" fill="#e2e8f0" font-size="10" text-anchor="middle" id="svg-traps-count">0 trampas IDPI</text>
+              <text x="882" y="188" fill="#f59e0b" font-size="10" text-anchor="middle" font-family="monospace" id="svg-beacons-count">0 autodelaciones</text>
+            </svg>
+          </div>
+        </div>
+
         <!-- 4 Guardians Direct Designation Cards -->
         <div class="agents-grid">
-          <!-- SENTINEL -->
           <article class="agent-card">
             <div class="agent-head">
               <div class="agent-title">👁️ Centinela WAF</div>
-              <span class="pill emerald">42 Canarios + DPI</span>
+              <span class="pill emerald">43+ Canarios + DPI</span>
             </div>
-            <div class="agent-desc">Detecta SQLi, XSS, SSRF, Java4Shell, Rate-Limit y rutas canario con 0 falsos positivos.</div>
+            <div class="agent-desc">DPI multicapa (SQLi, XSS, LFI, SSRF BlockList, RCE, SSTI/NoSQL/XXE) con 0 falsos positivos en prosa.</div>
             <div class="agent-assign">
               <div class="agent-assign-row">
                 <select id="card-SENTINEL-provider" onchange="onCardProviderChange('SENTINEL')"></select>
@@ -641,13 +809,12 @@
             </div>
           </article>
 
-          <!-- WEAVER -->
           <article class="agent-card">
             <div class="agent-head">
               <div class="agent-title">🕸️ Tejedor</div>
-              <span class="pill cyan">Byte-Drip $0.00</span>
+              <span class="pill cyan">Tarpit Adaptativo</span>
             </div>
-            <div class="agent-desc">Retiene sockets por goteo de chunks y genera nodos polimórficos para saturar al atacante.</div>
+            <div class="agent-desc">Retiene sockets por goteo con presupuesto máximo de concurrencia para proteger a clientes reales.</div>
             <div class="agent-assign">
               <div class="agent-assign-row">
                 <select id="card-WEAVER-provider" onchange="onCardProviderChange('WEAVER')"></select>
@@ -660,7 +827,6 @@
             </div>
           </article>
 
-          <!-- MIRAGE -->
           <article class="agent-card">
             <div class="agent-head">
               <div class="agent-title">🎭 Ilusionista</div>
@@ -673,19 +839,18 @@
                 <select id="card-MIRAGE-model" onchange="onCardModelSelect('MIRAGE')"></select>
               </div>
               <div class="agent-custom-row">
-                <input type="text" id="card-MIRAGE-custom" placeholder="Modelo libre (ej. anthropic/claude-3.7-sonnet)" />
+                <input type="text" id="card-MIRAGE-custom" placeholder="Modelo libre (ej. anthropic/claude-sonnet-4-5)" />
                 <button class="mini primary" onclick="applyGuardianCard('MIRAGE')">Aplicar</button>
               </div>
             </div>
           </article>
 
-          <!-- CHRONICLER -->
           <article class="agent-card">
             <div class="agent-head">
               <div class="agent-title">📜 Cronista</div>
-              <span class="pill amber">SQLite + Webhooks</span>
+              <span class="pill amber">SQLite Batched + HMAC</span>
             </div>
-            <div class="agent-desc">Coordina el diálogo del enjambre, calcula costos y redacta reportes ejecutivos.</div>
+            <div class="agent-desc">Coordina el diálogo regulado, webhooks firmados con timestamp anti-replay y reportes honestos.</div>
             <div class="agent-assign">
               <div class="agent-assign-row">
                 <select id="card-CHRONICLER-provider" onchange="onCardProviderChange('CHRONICLER')"></select>
@@ -697,58 +862,6 @@
               </div>
             </div>
           </article>
-        </div>
-
-        <!-- Live Network Topology SVG Map -->
-        <div class="topology-card">
-          <div class="topology-head">
-            <strong style="font-size:0.94rem;">🛰️ Topología de Intercepción y Desvío en Enjambre (Tiempo Real)</strong>
-            <div class="tag-row">
-              <span class="pill emerald">Tráfico Limpio ➔ Web Real</span>
-              <span class="pill crimson">Amenaza / DPI ➔ Cuarentena &amp; Byte-Drip</span>
-              <span class="pill violet">IDPI ➔ Autodelación</span>
-            </div>
-          </div>
-          <div class="topology-svg-wrap">
-            <svg class="topo-svg" viewBox="0 0 1000 225" xmlns="http://www.w3.org/2000/svg">
-              <!-- Connections -->
-              <path d="M 155 112 L 245 112" stroke="#3b82f6" stroke-width="2.5" />
-              <path d="M 465 90 C 535 55, 625 48, 725 48" class="flow-clean" />
-              <path d="M 465 135 C 515 165, 540 168, 575 168" class="flow-hostile" />
-              <path d="M 735 168 L 785 168" class="flow-deception" />
-              <path d="M 945 140 C 960 95, 920 60, 880 60" stroke="#f59e0b" stroke-width="1.6" stroke-dasharray="4 4" fill="none" />
-
-              <!-- Node 1: Ingress -->
-              <rect x="15" y="74" width="140" height="76" rx="10" fill="#10182b" stroke="#3b82f6" stroke-width="1.5" />
-              <text x="85" y="102" fill="#eef4ff" font-size="12" font-weight="700" text-anchor="middle">🌐 Tráfico HTTP</text>
-              <text x="85" y="122" fill="#8ea3c9" font-size="10" text-anchor="middle" font-family="monospace">Internet / Bots</text>
-              <text x="85" y="138" fill="#22d3ee" font-size="10" text-anchor="middle" font-family="monospace" id="svg-ingress-count">0 legítimas</text>
-
-              <!-- Node 2: Sentinel WAF -->
-              <rect x="245" y="62" width="220" height="100" rx="12" fill="#111d36" stroke="#10b981" stroke-width="2" />
-              <text x="355" y="92" fill="#10b981" font-size="13" font-weight="800" text-anchor="middle">👁️ CENTINELA WAF</text>
-              <text x="355" y="112" fill="#eef4ff" font-size="10" text-anchor="middle">42 Canarios · DPI Multicapa · Anti-Spoof</text>
-              <text x="355" y="130" fill="#f59e0b" font-size="10" text-anchor="middle" font-family="monospace" id="svg-threats-count">0 bloqueados</text>
-              <text x="355" y="148" fill="#8ea3c9" font-size="8.5" text-anchor="middle" font-family="monospace" id="svg-sentinel-model">local</text>
-
-              <!-- Node 3: Clean Web Origin -->
-              <rect x="725" y="14" width="245" height="68" rx="10" fill="#0c221d" stroke="#10b981" stroke-width="1.6" />
-              <text x="847" y="40" fill="#10b981" font-size="12" font-weight="700" text-anchor="middle">✅ Aplicación Real Protegida</text>
-              <text x="847" y="60" fill="#cbd5e1" font-size="10" text-anchor="middle" font-family="monospace" id="svg-target-domain">365collaboration.net</text>
-
-              <!-- Node 4: Weaver Labyrinth -->
-              <rect x="575" y="124" width="160" height="86" rx="10" fill="#23121c" stroke="#ef4444" stroke-width="1.8" />
-              <text x="655" y="150" fill="#fca5a5" font-size="12" font-weight="700" text-anchor="middle">🕸️ TEJEDOR TARPIT</text>
-              <text x="655" y="169" fill="#e2e8f0" font-size="10" text-anchor="middle">Byte-Drip ($0.00)</text>
-              <text x="655" y="188" fill="#22d3ee" font-size="10" text-anchor="middle" font-family="monospace" id="svg-nodes-count">0 nodos falsos</text>
-
-              <!-- Node 5: Mirage IDPI + Chronicler -->
-              <rect x="785" y="124" width="195" height="86" rx="10" fill="#1a1533" stroke="#a78bfa" stroke-width="1.8" />
-              <text x="882" y="150" fill="#ddd6fe" font-size="12" font-weight="700" text-anchor="middle">🎭 ILUSIONISTA + 📜 CRONISTA</text>
-              <text x="882" y="169" fill="#e2e8f0" font-size="10" text-anchor="middle" id="svg-traps-count">0 trampas IDPI</text>
-              <text x="882" y="188" fill="#f59e0b" font-size="10" text-anchor="middle" font-family="monospace" id="svg-beacons-count">0 autodelaciones</text>
-            </svg>
-          </div>
         </div>
 
         <!-- Bottom Split: Forensic Threat Inspector & Dialogue Console -->
@@ -771,15 +884,15 @@
         </div>
       </section>
 
-      <!-- VIEW 1B: Live Cyber Range (Round 1 Vulnerable vs Round 2 Protected) -->
+      <!-- VIEW 1B: Live Cyber Range -->
       <section id="view-range" class="view-panel">
         <div class="panel">
           <div class="panel-title">
-            <span>⚔️ Campo de Tiro Real: Servidor Víctima Sin Escudo vs. Protegido por Guardianes Eternos v3.1</span>
+            <span>⚔️ Campo de Tiro Real: Servidor Víctima Sin Escudo vs. Protegido por Guardianes Eternos v5.0</span>
             <button class="violet" onclick="runLiveCyberRange()">▶ Ejecutar Batalla Real en Vivo</button>
           </div>
           <div class="small">
-            Esta prueba levanta un servidor web real deliberadamente vulnerable y le dispara 6 ataques reales con evasión avanzada (SQLi con comentarios <code>UN/**/ION</code> en la ruta raíz <code>/</code>, rutas canario con doble barra y mayúsculas <code>///.ENV.backup</code>, doble codificación <code>%252e%252e</code>, SSRF AWS Metadata, <code>${jndi:}</code> / Java4Shell y rotación falsa de <code>X-Forwarded-For</code>).
+            Levanta un servidor víctima real vulnerable y dispara 6 ataques de Red Team (SQLi ofuscado <code>UN/**/ION</code>, evasión canario <code>///.ENV.backup</code>, doble codificación LFI, SSRF AWS Metadata, JNDI/Java4Shell y spoofing XFF + <code>x-sim-session</code>).
           </div>
         </div>
 
@@ -790,9 +903,9 @@
             <div class="small" id="r1-sub">Presiona "Ejecutar Batalla Real en Vivo" para lanzar el ataque contra el servidor víctima.</div>
           </div>
           <div class="range-summary-box protected">
-            <strong style="color:#6ee7b7;">🟢 RONDA 2: Protegido con Guardianes Eternos (Reverse-Proxy WAF)</strong>
+            <strong style="color:#6ee7b7;">🟢 RONDA 2: Protegido con Guardianes Eternos v5.0 (Reverse-Proxy Streaming)</strong>
             <div class="kpi-value" id="r2-score" style="color:var(--emerald);font-size:1.5rem;">— / 6 Atrapados</div>
-            <div class="small" id="r2-sub">0 fugas reales · Cliente legítimo intacto · Anti-Spoofing verificado.</div>
+            <div class="small" id="r2-sub">0 fugas reales · Cliente legítimo intacto · Anti-Spoofing + Anti-Bypass verificados.</div>
           </div>
         </div>
 
@@ -803,8 +916,8 @@
       <section id="view-agents" class="view-panel">
         <div class="config-grid">
           <div class="panel">
-            <div class="panel-title"><span>⚡ OpenRouter Hub &amp; Llaves BYOK (AES-256-GCM)</span></div>
-            <div class="small">Pega tus llaves de IA. OpenRouter permite usar más de 300 modelos (incluyendo :free) desde una sola llave.</div>
+            <div class="panel-title"><span>⚡ OpenRouter Hub &amp; Llaves BYOK (AES-256-GCM + kid)</span></div>
+            <div class="small">Pega tus llaves de IA. Se cifran con AES-256-GCM usando <code>GUARDIANES_VAULT_KEY</code> (o bóveda local) en SQLite.</div>
             <div class="field">
               <label>OpenRouter API Key <span id="status-openrouter" class="small"></span></label>
               <div style="display:flex;gap:8px;">
@@ -830,7 +943,7 @@
               </select>
             </div>
             <div class="field">
-              <label>Proveedor Unificado (si seleccionas Modo Unificado)</label>
+              <label>Proveedor Unificado</label>
               <select id="unified-provider" onchange="syncModelOptions('unified-provider', 'unified-model')"></select>
             </div>
             <div class="field">
@@ -838,12 +951,12 @@
               <select id="unified-model"></select>
             </div>
             <div class="field">
-              <label>Modelo Unificado Personalizado (Opcional para OpenRouter/Ollama)</label>
+              <label>Modelo Unificado Personalizado (OpenRouter/Ollama)</label>
               <input type="text" id="unified-custom-model" placeholder="ej. deepseek/deepseek-r1:free" />
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
               <div class="field"><label>Kill-Switch API/hora</label><input type="number" id="max-api-calls" min="0" max="10000" value="50" /></div>
-              <div class="field"><label>Byte-Drip Tarpit (ms)</label><input type="number" id="tarpit-delay" min="0" max="10000" value="1200" /></div>
+              <div class="field"><label>Byte-Drip Tarpit (ms)</label><input type="number" id="tarpit-delay" min="0" max="60000" value="1200" /></div>
             </div>
             <button class="primary" onclick="saveAllAIConfig()">💾 Guardar Todo en Bóveda Cifrada SQLite</button>
           </div>
@@ -854,29 +967,31 @@
       <section id="view-shield" class="view-panel">
         <div class="config-grid">
           <div class="panel">
-            <div class="panel-title"><span>🛡️ Escudo WAF DPI &amp; Reverse Proxy</span></div>
+            <div class="panel-title"><span>🛡️ Escudo WAF DPI v5.0 &amp; Reverse Proxy Streaming</span></div>
             <div class="field"><label>Dominio / Backend Protegido</label><input type="text" id="shield-target-url" value="https://www.365collaboration.net" /></div>
             <div class="field">
-              <label>Modo de Operación</label>
+              <label>Modo de Operación (Data Plane :4040)</label>
               <select id="shield-mode">
-                <option value="standalone">Standalone (Sensor + Desvío de Trampas + Exportación Firewall)</option>
-                <option value="reverse-proxy">Reverse Proxy Shield (Inyecta cabeceras de seguridad y cebo DOM al vuelo)</option>
+                <option value="standalone">Standalone / Nginx auth_request Sidecar (Recomendado en producción)</option>
+                <option value="reverse-proxy">Reverse Proxy Streaming (Preserva Cookies, Binarios y 302)</option>
               </select>
             </div>
-            <label>Reglas de Inspección Profunda (DPI)</label>
+            <label>Reglas de Inspección Profunda (DPI Multicapa)</label>
             <div class="checks-grid">
               <label class="check-item"><input type="checkbox" id="waf-sqli" checked /> SQL Injection</label>
-              <label class="check-item"><input type="checkbox" id="waf-xss" checked /> XSS &amp; Optimizely Skimming</label>
+              <label class="check-item"><input type="checkbox" id="waf-xss" checked /> XSS &amp; Entidades HTML</label>
               <label class="check-item"><input type="checkbox" id="waf-lfi" checked /> Path Traversal / LFI</label>
-              <label class="check-item"><input type="checkbox" id="waf-ssrf" checked /> SSRF Cloud Metadata</label>
+              <label class="check-item"><input type="checkbox" id="waf-ssrf" checked /> SSRF BlockList Canónico</label>
               <label class="check-item"><input type="checkbox" id="waf-rce" checked /> RCE / Java4Shell / JNDI</label>
+              <label class="check-item"><input type="checkbox" id="waf-ssti" checked /> SSTI / NoSQL / XXE / Proto</label>
               <label class="check-item"><input type="checkbox" id="waf-ratelimit" checked /> Anti-Burst Rate Limiter</label>
+              <label class="check-item"><input type="checkbox" id="shield-dom-canary" /> Inyectar Cebo DOM (Opt-in SEO Safe)</label>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
               <div class="field"><label>Máx. req / 10 seg</label><input type="number" id="waf-rate-max" value="25" /></div>
               <div class="field"><label>Umbral Auto-Cuarentena</label><input type="number" id="waf-quarantine-score" value="85" /></div>
             </div>
-            <div class="field"><label>Webhook SIEM / Slack / Discord (HMAC-SHA256)</label><input type="text" id="shield-webhook-url" placeholder="https://..." /></div>
+            <div class="field"><label>Webhook SIEM / Slack / Discord (HMAC + Timestamp Anti-Replay)</label><input type="text" id="shield-webhook-url" placeholder="https://..." /></div>
             <div class="field"><label>Secreto Firma Webhook <span id="status-webhook-secret" class="small"></span></label><input type="password" id="shield-webhook-secret" /></div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
               <div class="field"><label>Cloudflare Zone ID</label><input type="text" id="shield-cf-zone" /></div>
@@ -893,15 +1008,16 @@
               <a class="btn-link" href="/api/guardianes/export/iptables" download="guardianes-iptables.sh">⬇ iptables Linux (.sh)</a>
             </div>
             <div class="panel-title" style="margin-top:8px;"><span>🚀 Kit de Despliegue Instalable</span></div>
-            <div class="field"><label>1. Sensor JS + Trampa Headless <button class="mini" onclick="copyText('kit-html')">Copiar</button></label><textarea class="code-box" id="kit-html" readonly></textarea></div>
-            <div class="field"><label>2. Plugin WordPress (mu-plugins) <button class="mini" onclick="copyText('kit-wp')">Copiar</button></label><textarea class="code-box" id="kit-wp" readonly></textarea></div>
-            <div class="field"><label>3. Cloudflare Worker (worker.js) <button class="mini" onclick="copyText('kit-cf')">Copiar</button></label><textarea class="code-box" id="kit-cf" readonly></textarea></div>
-            <div class="field"><label>4. Middleware Next.js (middleware.ts) <button class="mini" onclick="copyText('kit-next')">Copiar</button></label><textarea class="code-box" id="kit-next" readonly></textarea></div>
+            <div class="field"><label>1. Nginx Sidecar auth_request (Producción Recomendada) <button class="mini" onclick="copyText('kit-nginx-auth')">Copiar</button></label><textarea class="code-box" id="kit-nginx-auth" readonly></textarea></div>
+            <div class="field"><label>2. Sensor JS (Nonce HMAC + sendBeacon) <button class="mini" onclick="copyText('kit-html')">Copiar</button></label><textarea class="code-box" id="kit-html" readonly></textarea></div>
+            <div class="field"><label>3. Plugin WordPress (mu-plugins) <button class="mini" onclick="copyText('kit-wp')">Copiar</button></label><textarea class="code-box" id="kit-wp" readonly></textarea></div>
+            <div class="field"><label>4. Cloudflare Worker (worker.js) <button class="mini" onclick="copyText('kit-cf')">Copiar</button></label><textarea class="code-box" id="kit-cf" readonly></textarea></div>
+            <div class="field"><label>5. Middleware Next.js (middleware.ts) <button class="mini" onclick="copyText('kit-next')">Copiar</button></label><textarea class="code-box" id="kit-next" readonly></textarea></div>
           </div>
         </div>
       </section>
 
-      <!-- VIEW 4: Reports & 42 Canary Routes -->
+      <!-- VIEW 4: Reports & Canary Routes -->
       <section id="view-reports" class="view-panel">
         <div class="soc-split">
           <div class="panel">
@@ -913,26 +1029,26 @@
           </div>
 
           <div class="panel">
-            <div class="panel-title"><span>🐤 42+ Rutas Canario Activas &amp; Laberinto</span></div>
-            <div class="small">Cualquier bot o atacante que toque estas rutas cae en cuarentena inmediata y en el Tarpit Byte-Drip:</div>
+            <div class="panel-title"><span>🐤 43+ Rutas Canario Activas (Bloqueadas en robots.txt)</span></div>
+            <div class="small">Todas las rutas canario están excluidas en <code>/robots.txt</code> para proteger el SEO de crawlers legítimos:</div>
             <div class="canary-grid" id="canary-grid"></div>
           </div>
         </div>
       </section>
 
-      <!-- VIEW 5: Comandante Hermes (AI SOC Copilot) -->
+      <!-- VIEW 5: Comandante Hermes (AI SOC Copilot v5.0 with 2-Step Confirmation) -->
       <section id="view-hermes" class="view-panel">
         <div class="panel">
           <div class="panel-title">
-            <span>⚡ Comandante Hermes — Copiloto Autónomo de Ciberseguridad</span>
+            <span>⚡ Comandante Hermes v5.0 — Copiloto Seguro con Confirmación en 2 Pasos</span>
             <div class="tag-row">
-              <span class="pill emerald">🔒 Aislamiento Anti-Prompt-Injection</span>
-              <span class="pill cyan">🛡️ Intent Firewall Determinista</span>
-              <span class="pill violet">🧠 Memoria &amp; Skills SQLite</span>
+              <span class="pill emerald">🔒 Telemetría Enum-Only (Cero Strings Crudos)</span>
+              <span class="pill amber">🛡️ Confirmación Obligatoria 2-Step</span>
+              <span class="pill violet">🧠 Skills Inyectadas en Contexto</span>
             </div>
           </div>
           <div class="small">
-            Habla en lenguaje natural para controlar todo el sistema sin conocimientos técnicos: crear trampas canario, añadir reglas WAF, aislar o liberar IPs, asignar modelos de OpenRouter, exportar firewalls o lanzar batallas reales.
+            Toda acción que modifique defensas (crear canarios, añadir reglas WAF, aislar/liberar IPs o cambiar modelos) exige confirmación explícita antes de ejecutarse.
           </div>
 
           <div class="hermes-chips">
@@ -953,14 +1069,27 @@
               <span class="pill cyan" id="hermes-turns-count">0 turnos</span>
             </div>
             <div class="hermes-feed" id="hermes-feed"></div>
+
+            <!-- 2-Step Confirmation Gate Banner (H-08) -->
+            <div class="hermes-pending-box" id="hermes-pending-box">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+                <strong style="color:var(--amber);font-size:0.84rem;" id="hermes-pending-title">⚠️ Confirmación pendiente</strong>
+                <div class="actions">
+                  <button class="mini primary" id="btn-hermes-confirm" onclick="confirmPendingHermes(true)">✅ Confirmar Cambio</button>
+                  <button class="mini danger" id="btn-hermes-cancel" onclick="confirmPendingHermes(false)">❎ Cancelar</button>
+                </div>
+              </div>
+              <div class="small mono" id="hermes-pending-list"></div>
+            </div>
+
             <div class="hermes-input-bar">
               <input
                 type="text"
                 id="hermes-input"
-                placeholder="Pídele a Hermes cualquier acción (ej. 'Crea una trampa canario en /pagos-privados' o 'Bloquea la IP 45.10.20.30')..."
+                placeholder="Pídele a Hermes cualquier acción (ej. 'Crea una trampa canario en /pagos-privados' o 'Bloquea la IP 198.51.100.10')..."
                 onkeydown="if (event.key === 'Enter') sendHermesMessage();"
               />
-              <button class="primary" onclick="sendHermesMessage()">⚡ Ejecutar</button>
+              <button class="primary" onclick="sendHermesMessage()">⚡ Enviar</button>
             </div>
           </div>
 
@@ -987,9 +1116,16 @@
 
   <div class="toast" id="toast"></div>
 
-  <script>
+  <script type="module">
+    import { HolographicSoc3D } from '/soc3d/soc3d.js';
+
     let catalog = {};
     let currentAiConfig = null;
+    let csrfToken = null;
+    let pendingActionId = null;
+    let eventSource = null;
+    let sseRefreshTimer = null;
+    let soc3d = null;
     const GUARDIANS = ['SENTINEL', 'WEAVER', 'MIRAGE', 'CHRONICLER'];
 
     function showToast(msg) {
@@ -1000,21 +1136,187 @@
       window.__toastTimer = setTimeout(() => { el.style.display = 'none'; }, 3800);
     }
 
-    function switchView(viewId, btn) {
+    async function apiGet(url) {
+      const res = await fetch(url, { credentials: 'same-origin' });
+      if (res.status === 401) {
+        openAuthGate();
+        throw new Error('Unauthorized');
+      }
+      return res.json();
+    }
+
+    async function apiPost(url, body = {}) {
+      const headers = { 'Content-Type': 'application/json' };
+      if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+      const res = await fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers,
+        body: JSON.stringify(body)
+      });
+      if (res.status === 401) {
+        openAuthGate();
+        throw new Error('Unauthorized');
+      }
+      return res.json();
+    }
+
+    function openAuthGate(errText = '') {
+      disconnectSSE();
+      document.getElementById('login-error').textContent = errText;
+      document.getElementById('auth-gate').classList.add('open');
+      setTimeout(() => document.getElementById('login-token-input')?.focus(), 50);
+    }
+
+    function closeAuthGate() {
+      document.getElementById('auth-gate').classList.remove('open');
+      document.getElementById('login-token-input').value = '';
+      document.getElementById('login-error').textContent = '';
+    }
+
+    window.submitAdminLogin = async function submitAdminLogin() {
+      const token = document.getElementById('login-token-input').value.trim();
+      const errEl = document.getElementById('login-error');
+      if (!token) {
+        errEl.textContent = 'Introduce tu GUARDIANES_ADMIN_TOKEN.';
+        return;
+      }
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token })
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          errEl.textContent = data.error || 'Token inválido.';
+          return;
+        }
+        csrfToken = data.csrfToken || null;
+        closeAuthGate();
+        await bootstrapAuthenticatedSoc();
+        showToast('Sesión administrativa autenticada (Cookie HttpOnly + CSRF).');
+      } catch {
+        errEl.textContent = 'Error de conexión con el Control Plane.';
+      }
+    };
+
+    window.logoutAdmin = async function logoutAdmin() {
+      try {
+        await apiPost('/api/auth/logout', {});
+      } catch {
+        // ignore
+      }
+      csrfToken = null;
+      openAuthGate('Sesión cerrada.');
+    };
+
+    function disconnectSSE() {
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+      const sb = document.getElementById('sb-sse');
+      if (sb) {
+        sb.textContent = 'Desconectado';
+        sb.style.color = 'var(--amber)';
+      }
+    }
+
+    function connectSSE() {
+      disconnectSSE();
+      const sb = document.getElementById('sb-sse');
+      try {
+        eventSource = new EventSource('/events', { withCredentials: true });
+        eventSource.addEventListener('hello', () => {
+          sb.textContent = '● SSE Activo';
+          sb.style.color = 'var(--emerald)';
+        });
+
+        const scheduleRefresh = (kind, ev) => {
+          if (soc3d) {
+            let parsed = {};
+            try { parsed = JSON.parse(ev.data || '{}'); } catch {}
+            soc3d.triggerPulse(kind, parsed);
+          }
+          clearTimeout(sseRefreshTimer);
+          sseRefreshTimer = setTimeout(() => {
+            fetchState(false).catch(() => {});
+          }, 250);
+        };
+
+        for (const evName of ['threat', 'quarantine', 'labyrinth', 'dialogue', 'beacon', 'report', 'reset']) {
+          eventSource.addEventListener(evName, (ev) => scheduleRefresh(evName, ev));
+        }
+
+        eventSource.onerror = () => {
+          sb.textContent = 'Reconectando...';
+          sb.style.color = 'var(--amber)';
+        };
+      } catch {
+        sb.textContent = 'SSE no disponible';
+      }
+    }
+
+    function init3DStage() {
+      if (soc3d) return;
+      const host = document.getElementById('soc3d-canvas-host');
+      soc3d = new HolographicSoc3D(host, {
+        onEngineReady(mode) {
+          const badge = document.getElementById('badge-3d-engine');
+          badge.textContent = mode === 'webgl-threejs' ? 'WebGL · Three.js 3D' : 'Canvas 3D Fallback';
+        },
+        onThreatSelect(threat) {
+          if (!threat) return;
+          const hud = document.getElementById('soc3d-selected-hud');
+          document.getElementById('hud-sel-title').textContent = `${threat.signature} · ${threat.ip}`;
+          document.getElementById('hud-sel-meta').textContent =
+            `Riesgo: ${threat.riskScore}/100 | Golpes: ${threat.totalHits} | ${threat.quarantined ? 'CUARENTENA ACTIVA' : threat.status}`;
+          document.getElementById('hud-sel-vectors').textContent =
+            `Vectores: ${(threat.attackVectors || []).join(', ') || 'SCAN'} · Tokens estimados: ${(threat.estimatedAttackerTokensBurned || 0).toLocaleString('en-US')}`;
+          hud.classList.add('open');
+        }
+      });
+      soc3d.init();
+    }
+
+    window.setTopologyMode = function setTopologyMode(mode) {
+      const stage3d = document.getElementById('soc3d-stage-wrap');
+      const stage2d = document.getElementById('topo-2d-wrap');
+      const b3 = document.getElementById('btn-view-3d');
+      const b2 = document.getElementById('btn-view-2d');
+      if (mode === '2d') {
+        stage3d.style.display = 'none';
+        stage2d.style.display = 'block';
+        b3.classList.remove('primary');
+        b2.classList.add('primary');
+        soc3d?.setPaused(true);
+      } else {
+        stage3d.style.display = 'block';
+        stage2d.style.display = 'none';
+        b3.classList.add('primary');
+        b2.classList.remove('primary');
+        soc3d?.setPaused(false);
+      }
+    };
+
+    window.switchView = function switchView(viewId, btn) {
       document.querySelectorAll('.view-panel').forEach((p) => p.classList.remove('active'));
       document.querySelectorAll('.nav-btn').forEach((b) => b.classList.remove('active'));
       document.getElementById(viewId).classList.add('active');
       if (btn) btn.classList.add('active');
-    }
+      soc3d?.setPaused(viewId !== 'view-soc');
+    };
 
-    function focusOpenRouterKey() {
-      switchView('view-soc', document.getElementById('nav-soc'));
+    window.focusOpenRouterKey = function focusOpenRouterKey() {
+      window.switchView('view-soc', document.getElementById('nav-soc'));
       const input = document.getElementById('quick-openrouter-key');
       input.focus();
       input.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+    };
 
-    async function copyText(id) {
+    window.copyText = async function copyText(id) {
       const el = document.getElementById(id);
       if (!el) return;
       try {
@@ -1025,7 +1327,7 @@
         document.execCommand('copy');
         showToast('Código copiado.');
       }
-    }
+    };
 
     function populateProviderSelect(selectId, selectedProvider) {
       const sel = document.getElementById(selectId);
@@ -1040,7 +1342,7 @@
       }
     }
 
-    function syncModelOptions(providerSelectId, modelSelectId, selectedModel) {
+    window.syncModelOptions = function syncModelOptions(providerSelectId, modelSelectId, selectedModel) {
       const providerKey = document.getElementById(providerSelectId).value;
       const models = [...(catalog[providerKey]?.models || [])];
       if (selectedModel && !models.includes(selectedModel)) {
@@ -1055,29 +1357,29 @@
         if (m === selectedModel) opt.selected = true;
         modelSel.appendChild(opt);
       }
-    }
+    };
 
-    function onCardProviderChange(guardianId) {
-      syncModelOptions(`card-${guardianId}-provider`, `card-${guardianId}-model`);
+    window.onCardProviderChange = function onCardProviderChange(guardianId) {
+      window.syncModelOptions(`card-${guardianId}-provider`, `card-${guardianId}-model`);
       document.getElementById(`card-${guardianId}-custom`).value = '';
-    }
+    };
 
-    function onCardModelSelect(guardianId) {
+    window.onCardModelSelect = function onCardModelSelect(guardianId) {
       document.getElementById(`card-${guardianId}-custom`).value = '';
-    }
+    };
 
     function hydrateForms(ai, shield) {
       currentAiConfig = ai;
       catalog = ai.catalog || {};
 
       populateProviderSelect('unified-provider', ai.unified.provider);
-      syncModelOptions('unified-provider', 'unified-model', ai.unified.model);
+      window.syncModelOptions('unified-provider', 'unified-model', ai.unified.model);
       document.getElementById('global-mode-select').value = ai.mode;
 
       for (const g of GUARDIANS) {
         const assigned = ai.activePerGuardian[g];
         populateProviderSelect(`card-${g}-provider`, assigned.provider);
-        syncModelOptions(`card-${g}-provider`, `card-${g}-model`, assigned.model);
+        window.syncModelOptions(`card-${g}-provider`, `card-${g}-model`, assigned.model);
         const isListed = (catalog[assigned.provider]?.models || []).includes(assigned.model);
         document.getElementById(`card-${g}-custom`).value = isListed ? '' : assigned.model;
       }
@@ -1102,7 +1404,9 @@
         document.getElementById('waf-lfi').checked = Boolean(shield.wafRules?.pathTraversal);
         document.getElementById('waf-ssrf').checked = Boolean(shield.wafRules?.ssrfMetadata);
         document.getElementById('waf-rce').checked = Boolean(shield.wafRules?.rceJava4Shell);
+        document.getElementById('waf-ssti').checked = Boolean(shield.wafRules?.sstiNosqlXxeProto ?? true);
         document.getElementById('waf-ratelimit').checked = Boolean(shield.wafRules?.behavioralRateLimit);
+        document.getElementById('shield-dom-canary').checked = Boolean(shield.injectDomCanary);
         document.getElementById('waf-rate-max').value = shield.wafRules?.rateLimitMaxPer10s ?? 25;
         document.getElementById('waf-quarantine-score').value = shield.wafRules?.autoQuarantineThreshold ?? 85;
         document.getElementById('shield-webhook-url').value = shield.webhookUrl || '';
@@ -1117,13 +1421,14 @@
       const ai = snapshot.ai;
       const shield = snapshot.shield;
 
+      soc3d?.updateSnapshot(snapshot);
+
       if (shield?.protectedTargetUrl) {
         document.getElementById('badge-target').textContent = shield.protectedTargetUrl;
         document.getElementById('svg-target-domain').textContent = shield.protectedTargetUrl.replace(/^https?:\/\//, '');
       }
-      document.getElementById('badge-persistence').textContent = `${snapshot.persistenceMode || 'sqlite'} + WAF DPI + Byte-Drip`;
+      document.getElementById('badge-persistence').textContent = `${snapshot.persistenceMode || 'sqlite'} · Batched + WAF v5`;
 
-      // Sidebar health & OpenRouter status
       const orStatus = ai.apiKeyStatus?.openrouter;
       const sbOr = document.getElementById('sb-openrouter');
       const orQuickStatus = document.getElementById('or-quick-status');
@@ -1139,21 +1444,27 @@
         orQuickStatus.style.color = 'var(--text-secondary)';
       }
 
+      const tarpitSockets = m.tarpitSocketsInUse || 0;
+      document.getElementById('sb-tarpit').textContent = `${tarpitSockets} / 1000`;
       document.getElementById('sb-mode').textContent = ai.mode === 'unified' ? 'UNIFICADO' : 'POR AGENTE';
       document.getElementById('sb-budget').textContent = `${ai.budgetState.apiCallsThisHour} / ${ai.maxApiCallsPerHour} API/h`;
 
       document.getElementById('btn-mode-specialized').classList.toggle('primary', ai.mode === 'specialized');
       document.getElementById('btn-mode-unified').classList.toggle('primary', ai.mode === 'unified');
 
-      // KPIs & Topology SVG live labels
+      // KPIs & HUD 3D
       document.getElementById('kpi-threats').textContent = String(snapshot.threats.length);
       document.getElementById('kpi-hits-sub').textContent = `${m.totalBlockedOrTrappedHits} golpes bloqueados · ${m.quarantinedCount || 0} en cuarentena`;
       document.getElementById('kpi-nodes').textContent = String(m.totalDecoyNodesGenerated);
-      document.getElementById('kpi-traps-sub').textContent = `${m.totalPromptTrapsInjected} trampas System Prompt activas`;
+      document.getElementById('kpi-traps-sub').textContent = `${m.totalPromptTrapsInjected} trampas IDPI · ${tarpitSockets} sockets tarpit`;
       document.getElementById('kpi-attacker-tokens').textContent = m.totalAttackerTokensBurned.toLocaleString('en-US');
-      document.getElementById('kpi-attacker-cost').textContent = `Costo drenado al hacker: ~$${m.estimatedAttackerCostUsd.toFixed(4)} USD`;
+      document.getElementById('kpi-attacker-cost').textContent = `Costo estimado drenado: ~$${m.estimatedAttackerCostUsd.toFixed(4)} USD`;
       document.getElementById('kpi-defense-spend').textContent = `$${ai.budgetState.defenseSpendUsd.toFixed(4)}`;
       document.getElementById('kpi-budget-sub').textContent = `${ai.budgetState.totalExternalCalls} externas · ${ai.budgetState.totalLocalCalls} locales $0.00`;
+
+      document.getElementById('hud-3d-legit').textContent = `Tráfico limpio: ${m.totalLegitRequests} req`;
+      document.getElementById('hud-3d-trapped').textContent = `Vórtice Tarpit: ${snapshot.threats.length} intrusos (${m.quarantinedCount || 0} aislados)`;
+      document.getElementById('hud-3d-sockets').textContent = `Sockets Tarpit: ${tarpitSockets} / 1000`;
 
       document.getElementById('svg-ingress-count').textContent = `${m.totalLegitRequests} legítimas`;
       document.getElementById('svg-threats-count').textContent = `${m.totalBlockedOrTrappedHits} bloqueados (${m.quarantinedCount || 0} aislados)`;
@@ -1169,7 +1480,7 @@
       if (snapshot.threats.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'small';
-        empty.textContent = 'Perímetro limpio. Ejecuta "Auditoría Pentest" o espera tráfico real hacia tus rutas protegidas.';
+        empty.textContent = 'Perímetro limpio. Ejecuta "Auditoría Pentest" o espera tráfico real hacia el Data Plane.';
         threatList.appendChild(empty);
       } else {
         for (const t of snapshot.threats) {
@@ -1205,7 +1516,7 @@
 
           const stats = document.createElement('div');
           stats.className = 'small mono';
-          stats.textContent = `Golpes: ${t.totalHits} | Profundidad: ${t.labyrinthDepth} | Quemados: ${t.estimatedAttackerTokensBurned.toLocaleString('en-US')} tokens (~$${t.estimatedAttackerCostUsd.toFixed(4)})`;
+          stats.textContent = `Golpes: ${t.totalHits} | Profundidad: ${t.labyrinthDepth} | Estimado: ${t.estimatedAttackerTokensBurned.toLocaleString('en-US')} tokens (~$${t.estimatedAttackerCostUsd.toFixed(4)})`;
 
           const tags = document.createElement('div');
           tags.className = 'tag-row';
@@ -1268,7 +1579,7 @@
       if (snapshot.executiveReports.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'small';
-        empty.textContent = 'Presiona "Reporte Ejecutivo" para redactar un resumen y guardarlo en SQLite + MEMORIA_PROYECTO.md.';
+        empty.textContent = 'Presiona "Reporte" para redactar un resumen y guardarlo en SQLite + MEMORIA_PROYECTO.md.';
         repList.appendChild(empty);
       } else {
         for (const r of snapshot.executiveReports) {
@@ -1295,13 +1606,10 @@
         const canaryGrid = document.getElementById('canary-grid');
         canaryGrid.replaceChildren();
         for (const p of canaryPaths) {
-          const a = document.createElement('a');
-          a.className = 'canary-link';
-          a.href = p;
-          a.target = '_blank';
-          a.rel = 'noopener noreferrer';
-          a.textContent = p;
-          canaryGrid.appendChild(a);
+          const item = document.createElement('div');
+          item.className = 'canary-link';
+          item.textContent = p;
+          canaryGrid.appendChild(item);
         }
       }
 
@@ -1311,37 +1619,30 @@
     }
 
     async function fetchState(updateForm = false) {
-      const res = await fetch('/api/guardianes/state');
-      const data = await res.json();
+      const data = await apiGet('/api/guardianes/state');
       if (data.ok) {
         renderSnapshot(data.snapshot, data.canaryPaths, updateForm);
         if (data.hermesState) renderHermesState(data.hermesState);
       }
     }
 
-    async function saveQuickOpenRouter() {
+    window.saveQuickOpenRouter = async function saveQuickOpenRouter() {
       const key = document.getElementById('quick-openrouter-key').value.trim();
       if (!key) {
         showToast('Pega primero tu OpenRouter API Key (sk-or-v1-...).');
         return;
       }
-      const res = await fetch('/api/guardianes/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKeys: { openrouter: key } })
-      });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/config', { apiKeys: { openrouter: key } });
       if (data.ok) {
         document.getElementById('quick-openrouter-key').value = '';
         renderSnapshot(data.snapshot, null, true);
         showToast('OpenRouter API Key guardada y cifrada (AES-256-GCM) en SQLite.');
       }
-    }
+    };
 
-    async function syncOpenRouterCatalog() {
+    window.syncOpenRouterCatalog = async function syncOpenRouterCatalog() {
       showToast('Consultando catálogo de modelos en OpenRouter...');
-      const res = await fetch('/api/guardianes/openrouter-models');
-      const data = await res.json();
+      const data = await apiGet('/api/guardianes/openrouter-models');
       if (data.ok && data.ai) {
         hydrateForms(data.ai, null);
         showToast(
@@ -1350,22 +1651,17 @@
             : `Usando catálogo base OpenRouter (${data.models.length} modelos listos).`
         );
       }
-    }
+    };
 
-    async function quickSetMode(mode) {
-      const res = await fetch('/api/guardianes/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode })
-      });
-      const data = await res.json();
+    window.quickSetMode = async function quickSetMode(mode) {
+      const data = await apiPost('/api/guardianes/config', { mode });
       if (data.ok) {
         renderSnapshot(data.snapshot, null, true);
-        showToast(mode === 'unified' ? 'Modo Unificado activado.' : 'Modo Por Agente (Especializado) activado.');
+        showToast(mode === 'unified' ? 'Modo Unificado activado.' : 'Modo Por Agente activado.');
       }
-    }
+    };
 
-    async function applyGuardianCard(guardianId) {
+    window.applyGuardianCard = async function applyGuardianCard(guardianId) {
       const provider = document.getElementById(`card-${guardianId}-provider`).value;
       const model = document.getElementById(`card-${guardianId}-model`).value;
       const customModel = document.getElementById(`card-${guardianId}-custom`).value.trim();
@@ -1376,20 +1672,15 @@
           ? { mode: 'unified', unified: assignment }
           : { mode: 'specialized', specialized: { [guardianId]: assignment } };
 
-      const res = await fetch('/api/guardianes/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/config', payload);
       if (data.ok) {
         renderSnapshot(data.snapshot, null, true);
         const active = data.ai.activePerGuardian[guardianId];
         showToast(`${guardianId} asignado a ${active.provider}:${active.model}.`);
       }
-    }
+    };
 
-    async function saveAllAIConfig() {
+    window.saveAllAIConfig = async function saveAllAIConfig() {
       const payload = {
         mode: document.getElementById('global-mode-select').value,
         unified: {
@@ -1410,12 +1701,7 @@
         tarpitDelayMs: Number(document.getElementById('tarpit-delay').value)
       };
 
-      const res = await fetch('/api/guardianes/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/config', payload);
       if (data.ok) {
         for (const p of ['openrouter', 'gemini', 'openai', 'anthropic', 'deepseek', 'groq']) {
           document.getElementById(`key-${p}`).value = '';
@@ -1423,26 +1709,21 @@
         renderSnapshot(data.snapshot, null, true);
         showToast('Configuración completa guardada y cifrada en SQLite.');
       }
-    }
+    };
 
-    async function loadDeployKit() {
-      const res = await fetch('/api/guardianes/deploy-kit');
-      const data = await res.json();
+    window.loadDeployKit = async function loadDeployKit() {
+      const data = await apiGet('/api/guardianes/deploy-kit');
       if (data.ok && data.kit) {
-        document.getElementById('kit-html').value = data.kit.htmlSensorSnippet;
-        document.getElementById('kit-wp').value = data.kit.wordpressPhpSnippet;
-        document.getElementById('kit-cf').value = data.kit.cloudflareWorkerSnippet;
-        document.getElementById('kit-next').value = data.kit.nextjsMiddlewareSnippet;
+        document.getElementById('kit-nginx-auth').value = data.kit.nginxAuthRequestSnippet || '';
+        document.getElementById('kit-html').value = data.kit.htmlSensorSnippet || '';
+        document.getElementById('kit-wp').value = data.kit.wordpressPhpSnippet || '';
+        document.getElementById('kit-cf').value = data.kit.cloudflareWorkerSnippet || '';
+        document.getElementById('kit-next').value = data.kit.nextjsMiddlewareSnippet || '';
       }
-    }
+    };
 
     async function toggleQuarantine(target, quarantined) {
-      const res = await fetch('/api/guardianes/quarantine', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target, quarantined })
-      });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/quarantine', { target, quarantined });
       if (data.ok) {
         renderSnapshot(data.snapshot, null, false);
         showToast(quarantined ? `IP/Actor ${target} aislado en cuarentena.` : `${target} liberado.`);
@@ -1456,7 +1737,7 @@
 
       document.getElementById('r2-score').textContent = `${cr.round2Summary.trappedByGuardianes} / ${cr.round2Summary.totalAttacks} ATRAPADOS · ${cr.round2Summary.realDataLeaks} FUGAS`;
       document.getElementById('r2-sub').textContent =
-        `Cliente legítimo: ${cr.legitVisitorCheck.passed ? 'OK (200 + Cebo DOM)' : 'ERR'} | Anti-Spoof X-Forwarded-For: ${cr.antiSpoofCheck.spoofBlocked ? 'BLOQUEADO EN CUARENTENA' : 'ERR'}`;
+        `Cliente legítimo: ${cr.legitVisitorCheck.passed ? 'OK (200 Streaming)' : 'ERR'} | Anti-Spoof XFF + Anti-Bypass: ${cr.antiSpoofCheck.spoofBlocked ? 'BLOQUEADO EN CUARENTENA' : 'ERR'}`;
 
       const list = document.getElementById('range-pair-list');
       list.replaceChildren();
@@ -1493,7 +1774,7 @@
         const c2Title = document.createElement('strong');
         c2Title.style.color = '#6ee7b7';
         c2Title.textContent = a2.blockedAndTrapped
-          ? `🟢 CON GUARDIANES — BLOQUEADO Y EN LABERINTO (${a2.canaryWatermark})`
+          ? `🟢 CON GUARDIANES v5 — BLOQUEADO Y EN LABERINTO (${a2.canaryWatermark})`
           : '🔴 FALLO';
         const c2Dir = document.createElement('div');
         c2Dir.style.color = 'var(--violet)';
@@ -1508,15 +1789,10 @@
       }
     }
 
-    async function runLiveCyberRange() {
-      switchView('view-range', document.getElementById('nav-range'));
+    window.runLiveCyberRange = async function runLiveCyberRange() {
+      window.switchView('view-range', document.getElementById('nav-range'));
       showToast('Levantando servidor víctima y ejecutando batalla real Ronda 1 vs. Ronda 2...');
-      const res = await fetch('/api/guardianes/cyber-range', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}'
-      });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/cyber-range', {});
       if (data.ok) {
         renderCyberRange(data.cyberRange);
         renderSnapshot(data.snapshot, null, false);
@@ -1524,42 +1800,38 @@
           `Batalla completada: Sin Escudo ${data.cyberRange.round1Summary.breachesSucceeded}/6 brechas | Con Escudo ${data.cyberRange.round2Summary.trappedByGuardianes}/6 atrapados.`
         );
       }
-    }
+    };
 
-    async function runAuditSuite() {
+    window.runAuditSuite = async function runAuditSuite() {
       showToast('Ejecutando auditoría pentest real (SQLi, SSRF, Java4Shell, ARTEX)...');
-      const res = await fetch('/api/guardianes/audit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: 'full-audit' })
-      });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/audit', { mode: 'full-audit' });
       if (data.ok) {
         renderSnapshot(data.snapshot, null, false);
         showToast(`Auditoría completada: ${data.audit.vectorsTested} vectores interceptados y aislados.`);
       }
-    }
+    };
 
-    async function generateReport() {
+    window.generateReport = async function generateReport() {
       showToast('El Cronista está generando el reporte ejecutivo...');
-      const res = await fetch('/api/guardianes/report', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/report', {});
       if (data.ok) {
         renderSnapshot(data.snapshot, null, false);
         showToast(`Reporte ${data.report.id} guardado en SQLite y MEMORIA_PROYECTO.md.`);
       }
-    }
+    };
 
-    async function saveShieldConfig() {
+    window.saveShieldConfig = async function saveShieldConfig() {
       const payload = {
         protectedTargetUrl: document.getElementById('shield-target-url').value,
         shieldMode: document.getElementById('shield-mode').value,
+        injectDomCanary: document.getElementById('shield-dom-canary').checked,
         wafRules: {
           sqlInjection: document.getElementById('waf-sqli').checked,
           xssSkimming: document.getElementById('waf-xss').checked,
           pathTraversal: document.getElementById('waf-lfi').checked,
           ssrfMetadata: document.getElementById('waf-ssrf').checked,
           rceJava4Shell: document.getElementById('waf-rce').checked,
+          sstiNosqlXxeProto: document.getElementById('waf-ssti').checked,
           behavioralRateLimit: document.getElementById('waf-ratelimit').checked,
           rateLimitMaxPer10s: Number(document.getElementById('waf-rate-max').value),
           autoQuarantineThreshold: Number(document.getElementById('waf-quarantine-score').value)
@@ -1570,29 +1842,23 @@
         cloudflareApiToken: document.getElementById('shield-cf-token').value
       };
 
-      const res = await fetch('/api/guardianes/shield', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/shield', payload);
       if (data.ok) {
         document.getElementById('shield-webhook-secret').value = '';
         document.getElementById('shield-cf-token').value = '';
         renderSnapshot(data.snapshot, null, true);
-        await loadDeployKit();
-        showToast('Configuración WAF guardada.');
+        await window.loadDeployKit();
+        showToast('Configuración WAF v5.0 guardada.');
       }
-    }
+    };
 
-    async function resetSession() {
-      const res = await fetch('/api/guardianes/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-      const data = await res.json();
+    window.resetSession = async function resetSession() {
+      const data = await apiPost('/api/guardianes/reset', {});
       if (data.ok) {
         renderSnapshot(data.snapshot, null, false);
         showToast('Sesión limpia.');
       }
-    }
+    };
 
     function renderHermesState(hState) {
       if (!hState) return;
@@ -1605,8 +1871,8 @@
         const welcome = document.createElement('div');
         welcome.className = 'hermes-bot';
         welcome.textContent =
-          '⚡ Comandante Hermes listo y aislado (Zero-Shell + Intent Firewall + Nonce Anti-Inyección). ' +
-          'Pídeme en lenguaje normal cualquier acción de ciberseguridad o haz clic en un botón rápido arriba.';
+          '⚡ Comandante Hermes v5.0 listo (Confirmación obligatoria 2-Step + Contexto Enum-Only + Intent Firewall). ' +
+          'Pídeme cualquier acción de ciberseguridad o haz clic en un botón rápido arriba.';
         feed.appendChild(welcome);
       } else {
         for (const t of turns) {
@@ -1646,6 +1912,20 @@
         feed.scrollTop = feed.scrollHeight;
       }
 
+      // Render 2-step pending confirmation box (H-08)
+      const pendingBox = document.getElementById('hermes-pending-box');
+      if (hState.pendingAction && Array.isArray(hState.pendingAction.actions) && hState.pendingAction.actions.length > 0) {
+        pendingActionId = hState.pendingAction.id;
+        document.getElementById('hermes-pending-title').textContent = `⚠️ Confirmación requerida [${pendingActionId}]`;
+        document.getElementById('hermes-pending-list').textContent = hState.pendingAction.actions
+          .map((a) => `• ${a.preview}`)
+          .join('\n');
+        pendingBox.classList.add('open');
+      } else {
+        pendingActionId = null;
+        pendingBox.classList.remove('open');
+      }
+
       const skillsList = document.getElementById('hermes-skills-list');
       const skills = hState.skills || [];
       document.getElementById('hermes-skills-count').textContent = `${skills.length} skills`;
@@ -1678,7 +1958,7 @@
       if (canaries.length === 0 && keywords.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'small';
-        empty.textContent = 'Crea canarios o reglas WAF desde el chat y aparecerán activos aquí.';
+        empty.textContent = 'Crea canarios o reglas WAF desde el chat y aparecerán activos aquí tras confirmar.';
         rulesList.appendChild(empty);
       } else {
         for (const c of canaries) {
@@ -1698,24 +1978,34 @@
       }
     }
 
-    async function sendHermesPreset(text) {
+    window.sendHermesPreset = async function sendHermesPreset(text) {
       document.getElementById('hermes-input').value = text;
-      await sendHermesMessage();
-    }
+      await window.sendHermesMessage();
+    };
 
-    async function sendHermesMessage() {
+    window.confirmPendingHermes = async function confirmPendingHermes(approve) {
+      if (!pendingActionId) return;
+      const data = await apiPost('/api/guardianes/hermes/chat', {
+        message: approve ? 'CONFIRMAR' : 'CANCELAR',
+        confirm: approve,
+        cancel: !approve,
+        confirmationId: pendingActionId
+      });
+      if (data.ok) {
+        renderSnapshot(data.snapshot, data.canaryPaths, true);
+        renderHermesState(data.hermesState);
+        showToast(approve ? 'Cambio confirmado y aplicado por Hermes.' : 'Acción pendiente cancelada.');
+      }
+    };
+
+    window.sendHermesMessage = async function sendHermesMessage() {
       const input = document.getElementById('hermes-input');
       const message = input.value.trim();
       if (!message) return;
       input.value = '';
-      showToast('Comandante Hermes procesando orden...');
+      showToast('Comandante Hermes procesando...');
 
-      const res = await fetch('/api/guardianes/hermes/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message })
-      });
-      const data = await res.json();
+      const data = await apiPost('/api/guardianes/hermes/chat', { message });
       if (data.ok) {
         renderSnapshot(data.snapshot, data.canaryPaths, true);
         renderHermesState(data.hermesState);
@@ -1729,16 +2019,42 @@
             'view-shield': 'nav-shield',
             'view-reports': 'nav-reports'
           };
-          switchView(v, document.getElementById(navMap[v]));
+          window.switchView(v, document.getElementById(navMap[v]));
         }
-        showToast('Orden ejecutada por Comandante Hermes.');
+        showToast(
+          data.turn?.pendingAction
+            ? 'Acción en espera: confirma para aplicar cambios.'
+            : 'Respuesta lista de Comandante Hermes.'
+        );
       } else if (data.error) {
         showToast(data.error);
       }
+    };
+
+    async function bootstrapAuthenticatedSoc() {
+      init3DStage();
+      await fetchState(true);
+      await window.loadDeployKit();
+      connectSSE();
     }
 
-    fetchState(true).then(() => loadDeployKit());
-    setInterval(() => fetchState(false), 3500);
+    async function checkSessionAndStart() {
+      try {
+        const res = await fetch('/api/auth/session', { credentials: 'same-origin' });
+        const data = await res.json();
+        if (data.authenticated) {
+          csrfToken = data.csrfToken || null;
+          closeAuthGate();
+          await bootstrapAuthenticatedSoc();
+        } else {
+          openAuthGate();
+        }
+      } catch {
+        openAuthGate('No se pudo verificar la sesión.');
+      }
+    }
+
+    checkSessionAndStart();
   </script>
 </body>
 </html>

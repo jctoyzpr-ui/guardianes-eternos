@@ -1,6 +1,7 @@
 /**
  * @fileoverview Exportador Real de Reglas de Firewall (Nginx, iptables, Cloudflare WAF),
- * Webhooks firmados con HMAC-SHA256, Cloudflare Auto-Ban y Generador de Kits de Despliegue.
+ * Webhooks firmados con HMAC-SHA256 + Timestamp anti-replay (M-06),
+ * Cloudflare Auto-Ban y Generador de Kits de Despliegue (incl. Nginx auth_request sidecar).
  */
 
 import crypto from 'node:crypto';
@@ -33,7 +34,7 @@ export function extractHostileIps(threats = []) {
 export function exportNginxDenyConf(threats = []) {
   const ips = extractHostileIps(threats);
   const lines = [
-    '# Guardianes Eternos — Reglas de Bloqueo Automático Nginx',
+    '# Guardianes Eternos v5.0 — Reglas de Bloqueo Automático Nginx',
     `# Generado: ${new Date().toISOString()}`,
     '# Incluir en /etc/nginx/conf.d/guardianes-deny.conf y ejecutar: nginx -t && systemctl reload nginx',
     ''
@@ -53,7 +54,7 @@ export function exportIptablesScript(threats = []) {
   const ips = extractHostileIps(threats);
   const lines = [
     '#!/usr/bin/env bash',
-    '# Guardianes Eternos — Bloqueo a Nivel Kernel Linux (iptables / ufw)',
+    '# Guardianes Eternos v5.0 — Bloqueo a Nivel Kernel Linux (iptables / ufw)',
     `# Generado: ${new Date().toISOString()}`,
     'set -euo pipefail',
     ''
@@ -92,7 +93,8 @@ export function exportCloudflareWaf(threats = []) {
 }
 
 /**
- * Envía una alerta webhook firmada con HMAC-SHA256 hacia Slack, Discord, n8n o SIEM.
+ * Envía una alerta webhook firmada con HMAC-SHA256 sobre `${timestamp}.${body}`
+ * incluyendo `X-Guardianes-Timestamp` para defensa anti-replay (M-06).
  */
 export async function dispatchSignedWebhook({ webhookUrl, webhookSecret = '', event }) {
   if (!webhookUrl || (!webhookUrl.startsWith('https://') && !webhookUrl.startsWith('http://'))) {
@@ -100,13 +102,18 @@ export async function dispatchSignedWebhook({ webhookUrl, webhookSecret = '', ev
   }
 
   const body = JSON.stringify(event);
+  const timestamp = String(Math.floor(Date.now() / 1000));
   const headers = {
     'Content-Type': 'application/json',
-    'User-Agent': 'GuardianesEternos-Webhook/2.0'
+    'User-Agent': 'GuardianesEternos-Webhook/5.0',
+    'X-Guardianes-Timestamp': timestamp
   };
 
   if (webhookSecret) {
-    const sig = crypto.createHmac('sha256', webhookSecret).update(body).digest('hex');
+    const sig = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(`${timestamp}.${body}`)
+      .digest('hex');
     headers['X-Guardianes-Signature'] = `sha256=${sig}`;
   }
 
@@ -158,33 +165,47 @@ export async function pushCloudflareIpBlock({ apiToken, zoneId, ip, note = 'Bloc
 }
 
 /**
- * Genera el sensor JS ligero para incrustar en cualquier sitio web (ej. 365collaboration.net).
+ * Genera el sensor JS ligero con nonce firmado por el servidor (H-03) y sendBeacon cross-origin (M-03).
+ * Usa rel="nofollow noopener" para no afectar SEO ni crawlers legítimos (H-04).
  */
-export function buildSensorScript(shieldEndpointBase = '') {
+export function buildSensorScript(shieldEndpointBase = '', { sensorNonce = '', injectTrapLink = false } = {}) {
   const endpoint = shieldEndpointBase ? `${shieldEndpointBase.replace(/\/+$/, '')}` : '';
-  return `/* Guardianes Eternos Browser & Headless Sensor v2.0 (MIT) */
+  const safeNonce = String(sensorNonce || '').replace(/[^a-zA-Z0-9._-]/g, '');
+
+  return `/* Guardianes Eternos Browser & Headless Sensor v5.0 (MIT) */
 (function(){
   try {
     var isHeadless = Boolean(navigator.webdriver || window.__playwright || window._phantom || window.callPhantom);
-    var trap = document.createElement('a');
-    trap.href = '${endpoint}/api/v1/internal/admin-keys';
-    trap.textContent = 'Internal Admin Vault';
-    trap.setAttribute('aria-hidden', 'true');
-    trap.setAttribute('tabindex', '-1');
-    trap.style.cssText = 'position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden;opacity:0;';
-    if (document.body) document.body.appendChild(trap);
+    if (${injectTrapLink ? 'true' : 'false'}) {
+      var trap = document.createElement('a');
+      trap.href = '${endpoint}/api/v1/internal/admin-keys';
+      trap.textContent = 'Internal Admin Vault';
+      trap.setAttribute('rel', 'nofollow noopener');
+      trap.setAttribute('aria-hidden', 'true');
+      trap.setAttribute('tabindex', '-1');
+      trap.style.cssText = 'position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden;opacity:0;';
+      if (document.body) document.body.appendChild(trap);
+    }
 
     if (isHeadless) {
-      fetch('${endpoint}/api/guardianes/telemetry-beacon', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: 'HEADLESS_BROWSER_DETECTED',
-          webdriver: Boolean(navigator.webdriver),
-          href: location.href,
-          ua: navigator.userAgent
-        })
-      }).catch(function(){});
+      var payload = JSON.stringify({
+        type: 'HEADLESS_BROWSER_DETECTED',
+        nonce: '${safeNonce}',
+        webdriver: Boolean(navigator.webdriver),
+        href: location.href,
+        ua: navigator.userAgent
+      });
+      var beaconUrl = '${endpoint}/telemetry-beacon';
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(beaconUrl, new Blob([payload], { type: 'text/plain;charset=UTF-8' }));
+      } else {
+        fetch(beaconUrl, {
+          method: 'POST',
+          mode: 'cors',
+          headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+          body: payload
+        }).catch(function(){});
+      }
     }
   } catch (e) {}
 })();
@@ -192,20 +213,46 @@ export function buildSensorScript(shieldEndpointBase = '') {
 }
 
 /**
- * Construye el Kit de Despliegue Real para WordPress, Next.js, Cloudflare Workers y HTML estático.
+ * Construye el Kit de Despliegue Real para Nginx auth_request Sidecar, WordPress, Next.js,
+ * Cloudflare Workers y HTML estático.
  */
-export function buildDeployKit({ guardianBaseUrl = 'https://shield.365collaboration.net', protectedTargetUrl = 'https://www.365collaboration.net' } = {}) {
+export function buildDeployKit({
+  guardianBaseUrl = 'https://shield.365collaboration.net',
+  protectedTargetUrl = 'https://www.365collaboration.net'
+} = {}) {
   const base = guardianBaseUrl.replace(/\/+$/, '');
   const target = protectedTargetUrl.replace(/\/+$/, '');
 
   return {
     protectedTargetUrl: target,
     guardianBaseUrl: base,
+    nginxAuthRequestSnippet: `# Recomendado para producción: Nginx / Caddy Sidecar con auth_request (cero latencia en estáticos)
+# Colocar dentro de server { ... } para ${target}
+location = /guardianes/check {
+    internal;
+    proxy_pass http://127.0.0.1:4040/guardianes/check;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URI $request_uri;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header User-Agent $http_user_agent;
+}
+
+location / {
+    auth_request /guardianes/check;
+    error_page 403 = @guardianes_tarpit;
+    proxy_pass ${target};
+}
+
+location @guardianes_tarpit {
+    proxy_pass http://127.0.0.1:4040;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}`,
     htmlSensorSnippet: `<!-- Pegar antes de </body> en ${target} -->\n<script src="${base}/guardianes-sensor.js" defer></script>`,
     wordpressPhpSnippet: `<?php
 /**
  * Pegar en wp-content/mu-plugins/guardianes-eternos.php
- * Redirige escáneres de secretos e intentos SQLi/RCE hacia el Laberinto Tarpit de Guardianes Eternos.
+ * Redirige escáneres de secretos hacia el Laberinto Tarpit de Guardianes Eternos.
  */
 add_action('init', function () {
     $uri = $_SERVER['REQUEST_URI'] ?? '/';

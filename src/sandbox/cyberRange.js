@@ -1,10 +1,10 @@
 /**
- * @fileoverview Campo de Tiro Real (Live Cyber Range):
+ * @fileoverview Campo de Tiro Real (Live Cyber Range) v5.0:
  * Levanta un Servidor Víctima Real Vulnerable en un puerto efímero y ejecuta
  * ataques reales de Red Team en dos rondas:
  *   - Ronda 1: Ataque directo al Servidor Víctima SIN Guardianes Eternos.
- *   - Ronda 2: Los mismos ataques con técnicas de evasión contra Guardianes Eternos v3.1
- *              en modo Reverse-Proxy delante del Servidor Víctima.
+ *   - Ronda 2: Los mismos ataques con técnicas de evasión contra Guardianes Eternos v5.0
+ *              Data Plane en modo Reverse-Proxy delante del Servidor Víctima.
  */
 
 import http from 'node:http';
@@ -150,7 +150,7 @@ const RED_TEAM_ATTACKS = [
 ];
 
 /**
- * Ejecuta la batalla real comparativa: Ronda 1 (Sin Escudo) vs Ronda 2 (Con Guardianes Eternos Reverse-Proxy).
+ * Ejecuta la batalla real comparativa: Ronda 1 (Sin Escudo) vs Ronda 2 (Con Guardianes Eternos v5.0 Reverse-Proxy).
  */
 export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
   const victimServer = createVulnerableTargetServer();
@@ -158,16 +158,21 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
   const victimPort = victimServer.address().port;
   const victimUrl = `http://127.0.0.1:${victimPort}`;
 
-  const { server: shieldServer, swarm } = createGuardianesServerFn({
+  const instance = createGuardianesServerFn({
     dbPath: ':memory:',
     memoryFilePath: null,
+    adminToken: 'cyber-range-ephemeral-token',
     aiConfig: { tarpitDelayMs: 0 },
     shieldConfigOverride: {
       shieldMode: 'reverse-proxy',
       protectedTargetUrl: victimUrl,
-      trustProxyHeaders: false
+      trustProxyHeaders: false,
+      injectDomCanary: true
     }
   });
+  const shieldServer = instance.dataServer;
+  const swarm = instance.swarm;
+
   await new Promise((resolve) => shieldServer.listen(0, '127.0.0.1', resolve));
   const shieldPort = shieldServer.address().port;
   const shieldUrl = `http://127.0.0.1:${shieldPort}`;
@@ -192,7 +197,6 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
     }
 
     // --- RONDA 2: Visitante Legítimo + Mismo Ataque contra GUARDIANES ETERNOS (CON ESCUDO) ---
-    // 2A. Primero verificar que un cliente real entra perfecto a la web protegida
     const legitRes = await fetch(`${shieldUrl}/servicios`, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/130.0' }
     });
@@ -202,7 +206,7 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
         legitRes.status === 200 &&
         legitBody.includes('Portal Legitimo OK') &&
         legitBody.includes('guardianes-sensor.js') &&
-        legitRes.headers.get('x-protected-by') === 'Guardianes-Eternos-Swarm-WAF/2.0',
+        legitRes.headers.get('x-protected-by') === 'Guardianes-Eternos-Swarm-WAF/5.0',
       statusCode: legitRes.status,
       protectedHeader: legitRes.headers.get('x-protected-by'),
       canaryInjectedInHtml: legitBody.includes('/api/v1/internal/admin-keys')
@@ -211,8 +215,6 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
     // 2B. Lanzar los 6 ataques reales contra el Escudo
     const round2 = [];
     for (const atk of RED_TEAM_ATTACKS) {
-      // Limpiamos el estado entre ataques individuales solo para medir cada firma pura por separado,
-      // salvo el último paso que también prueba Anti-Spoofing
       if (atk.id !== 'artex-ip-spoof') {
         swarm.memory.reset(true);
       }
@@ -237,11 +239,12 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
       });
     }
 
-    // 2C. Prueba Anti-Spoofing: atacante ya en cuarentena intenta rotar X-Forwarded-For para tocar /servicios
+    // 2C. Prueba Anti-Spoofing: atacante ya en cuarentena intenta rotar X-Forwarded-For y x-sim-session para tocar /servicios
     const spoofRes = await fetch(`${shieldUrl}/servicios`, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Clean-Look-Browser)',
-        'x-forwarded-for': '8.8.4.4'
+        'x-forwarded-for': '8.8.4.4',
+        'x-sim-session': 'try-bypass-quarantine'
       }
     });
     const spoofBody = await spoofRes.text();
@@ -275,7 +278,7 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
       round2
     };
   } finally {
-    await new Promise((resolve) => shieldServer.close(resolve));
+    await instance.closeAll();
     await new Promise((resolve) => victimServer.close(resolve));
   }
 }

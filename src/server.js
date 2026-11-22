@@ -1,12 +1,15 @@
 /**
- * @fileoverview Servidor HTTP Nativo de Guardianes Eternos v2.0 (Producción).
- * Integra SQLite Nativo (node:sqlite), WAF DPI, Byte-Drip Socket Tarpit,
- * Reverse Proxy Shield, Sensor JS, Exportadores Firewall (Cloudflare/Nginx/iptables)
- * y Centro de Mando Visual.
+ * @fileoverview Servidor HTTP Nativo de Guardianes Eternos v5.0 (Arquitectura Enterprise Dual-Plane).
+ * - Data Plane (puerto 4040): WAF DPI multicapa, Byte-Drip Tarpit con presupuesto de sockets (H-07),
+ *   Streaming Reverse Proxy sin corrupción binaria (H-06), sidecar /guardianes/check (nginx auth_request),
+ *   robots.txt completo (H-04) y /telemetry-beacon con nonce HMAC firmado (H-03, M-03).
+ * - Control Plane (puerto 4041, loopback): Autenticación obligatoria por token/sesión firmada (C-01),
+ *   anti-CSRF + anti-DNS-Rebinding (C-02), SSE en vivo GET /events para el SOC Holográfico 3D y Comandante Hermes v5.0.
  */
 
 import crypto from 'node:crypto';
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,7 +37,32 @@ const DEFAULT_MEMORY_FILE = path.resolve(ROOT_DIR, 'MEMORIA_PROYECTO.md');
 const DEFAULT_DB_FILE = path.resolve(ROOT_DIR, 'data/guardianes.sqlite');
 
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
-const MAX_DPI_BODY_BYTES = 64 * 1024;
+const MAX_DPI_INSPECT_BYTES = 64 * 1024;
+const MAX_PROXY_BODY_BYTES = 20 * 1024 * 1024;
+const DEFAULT_TRUSTED_PROXIES = ['127.0.0.1', '::1'];
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailers',
+  'transfer-encoding',
+  'upgrade'
+]);
+
+function sha256Hex(val) {
+  return crypto.createHash('sha256').update(String(val)).digest('hex');
+}
+
+function timingSafeHexEquals(aHex, bHex) {
+  if (!aHex || !bHex || typeof aHex !== 'string' || typeof bHex !== 'string') return false;
+  const a = Buffer.from(aHex);
+  const b = Buffer.from(bHex);
+  if (a.length !== b.length || a.length === 0) return false;
+  return crypto.timingSafeEqual(a, b);
+}
 
 function maskSecret(val) {
   if (!val || typeof val !== 'string') return '';
@@ -44,6 +72,7 @@ function maskSecret(val) {
 }
 
 function sendJson(res, statusCode, payload, extraHeaders = {}) {
+  if (res.writableEnded || res.destroyed) return;
   const body = JSON.stringify(payload, null, 2);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -54,7 +83,24 @@ function sendJson(res, statusCode, payload, extraHeaders = {}) {
   res.end(body);
 }
 
-function readRawBody(req, maxBytes = MAX_JSON_BODY_BYTES) {
+function parseCookies(cookieHeader = '') {
+  const out = {};
+  if (!cookieHeader || typeof cookieHeader !== 'string') return out;
+  for (const pair of cookieHeader.split(';')) {
+    const idx = pair.indexOf('=');
+    if (idx <= 0) continue;
+    const key = pair.slice(0, idx).trim();
+    const val = pair.slice(idx + 1).trim();
+    if (key) out[key] = decodeURIComponent(val);
+  }
+  return out;
+}
+
+/**
+ * Lee el cuerpo como Buffer crudo (sin corrupción UTF-8 de uploads binarios - H-06)
+ * y extrae hasta 64 KB como vista de texto para inspección DPI.
+ */
+function readBodyBuffer(req, maxBytes = MAX_JSON_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     let totalBytes = 0;
     const chunks = [];
@@ -70,7 +116,7 @@ function readRawBody(req, maxBytes = MAX_JSON_BODY_BYTES) {
     });
 
     req.on('end', () => {
-      resolve(chunks.length === 0 ? '' : Buffer.concat(chunks).toString('utf8'));
+      resolve(chunks.length === 0 ? Buffer.alloc(0) : Buffer.concat(chunks));
     });
 
     req.on('error', reject);
@@ -78,7 +124,8 @@ function readRawBody(req, maxBytes = MAX_JSON_BODY_BYTES) {
 }
 
 async function readJsonBody(req) {
-  const raw = await readRawBody(req, MAX_JSON_BODY_BYTES);
+  const buf = await readBodyBuffer(req, MAX_JSON_BODY_BYTES);
+  const raw = buf.toString('utf8');
   if (!raw.trim()) return {};
   try {
     return JSON.parse(raw);
@@ -87,16 +134,35 @@ async function readJsonBody(req) {
   }
 }
 
-function resolveClientIdentity(req, trustProxyHeaders = false) {
+/**
+ * H-03: Resolución segura de IP cliente recorriendo X-Forwarded-For de DERECHA a IZQUIERDA
+ * y confiando únicamente cuando el socket TCP proviene de un proxy en trustedProxies.
+ */
+export function resolveClientIdentity(req, trustProxyHeaders = false, trustedProxies = DEFAULT_TRUSTED_PROXIES) {
   const remoteRaw = String(req.socket?.remoteAddress || '127.0.0.1').replace(/^::ffff:/, '');
   const socketIp = isValidIpAddress(remoteRaw) ? remoteRaw : '127.0.0.1';
+  const trustedSet = new Set(
+    (Array.isArray(trustedProxies) && trustedProxies.length > 0 ? trustedProxies : DEFAULT_TRUSTED_PROXIES).map((p) =>
+      String(p).replace(/^::ffff:/, '').trim()
+    )
+  );
 
-  if (trustProxyHeaders) {
+  if (trustProxyHeaders && trustedSet.has(socketIp)) {
     const forwarded = req.headers['x-forwarded-for'];
     if (typeof forwarded === 'string' && forwarded.trim()) {
-      const candidate = forwarded.split(',')[0].replace(/^::ffff:/, '').trim();
-      if (isValidIpAddress(candidate)) {
-        return { clientIp: candidate, socketIp };
+      const hops = forwarded
+        .split(',')
+        .map((h) => h.replace(/^::ffff:/, '').trim())
+        .filter((h) => isValidIpAddress(h));
+
+      // Recorre de derecha a izquierda saltando proxies de confianza para evitar spoofing del extremo izquierdo
+      for (let i = hops.length - 1; i >= 0; i -= 1) {
+        if (!trustedSet.has(hops[i])) {
+          return { clientIp: hops[i], socketIp };
+        }
+      }
+      if (hops.length > 0) {
+        return { clientIp: hops[0], socketIp };
       }
     }
   }
@@ -104,117 +170,182 @@ function resolveClientIdentity(req, trustProxyHeaders = false) {
   return { clientIp: socketIp, socketIp };
 }
 
-function isAuthorizedControlRequest(req, socketIp, adminToken) {
-  if (adminToken) {
-    const authHeader = String(req.headers['authorization'] || '');
-    const customToken = String(req.headers['x-guardianes-admin-token'] || '');
-    const provided = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : customToken.trim();
-    const a = Buffer.from(provided);
-    const b = Buffer.from(adminToken);
-    if (a.length !== b.length || a.length === 0) return false;
-    return crypto.timingSafeEqual(a, b);
+/**
+ * Verifica que el Host header del Control Plane pertenezca a la lista blanca (anti-DNS Rebinding - C-02).
+ */
+function isAllowedControlHost(hostHeader, allowedHostsSet) {
+  if (!hostHeader || typeof hostHeader !== 'string') return false;
+  const trimmed = hostHeader.trim().toLowerCase();
+  if (!trimmed) return false;
+  let hostname = trimmed;
+  if (hostname.startsWith('[')) {
+    const end = hostname.indexOf(']');
+    if (end === -1) return false;
+    hostname = hostname.slice(0, end + 1);
+  } else {
+    const colon = hostname.indexOf(':');
+    if (colon !== -1) hostname = hostname.slice(0, colon);
   }
-  // Sin token explícito, las rutas administrativas solo responden al operador local en loopback
-  return socketIp === '127.0.0.1' || socketIp === '::1';
+  return allowedHostsSet.has(hostname);
 }
 
 /**
- * Envía el laberinto mediante Byte-Drip Socket Streaming para retener hilos ofensivos reales.
+ * Verifica Origin y Sec-Fetch-Site en peticiones mutantes del Control Plane (anti-CSRF - C-02).
  */
-async function streamTarpitResponse(req, res, { trapPayload, labyrinthResponse }) {
-  res.writeHead(200, {
-    'Content-Type': labyrinthResponse.contentType,
-    'X-Kernel-Verification-Directive': trapPayload.headerDirective,
-    'X-Canary-Watermark': labyrinthResponse.canaryToken,
-    'X-Content-Type-Options': 'nosniff',
-    'Cache-Control': 'no-store'
-  });
-
-  const totalDelay = Math.min(Math.max(0, labyrinthResponse.delayMs || 0), 4000);
-  const chunks = labyrinthResponse.chunks || [labyrinthResponse.body];
-
-  if (totalDelay === 0 || chunks.length <= 1) {
-    res.end(labyrinthResponse.body);
-    return;
+function isSafeControlOrigin(req, allowedHostsSet) {
+  const secFetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (secFetchSite && !['same-origin', 'none'].includes(secFetchSite)) {
+    return false;
   }
-
-  const stepDelay = Math.max(25, Math.floor(totalDelay / chunks.length));
-  for (let i = 0; i < chunks.length; i += 1) {
-    if (res.destroyed || req.destroyed) break;
-    res.write(chunks[i]);
-    if (i < chunks.length - 1) {
-      await new Promise((resolve) => setTimeout(resolve, stepDelay));
+  const origin = req.headers['origin'];
+  if (origin) {
+    try {
+      const parsed = new URL(String(origin));
+      const host = parsed.hostname.toLowerCase();
+      const bracketed = host.includes(':') ? `[${host}]` : host;
+      if (!allowedHostsSet.has(host) && !allowedHostsSet.has(bracketed)) {
+        return false;
+      }
+    } catch {
+      return false;
     }
   }
-  if (!res.destroyed) {
-    res.end();
-  }
+  return true;
 }
 
 /**
- * Inyecta cabeceras de blindaje HTTP y cebo DOM invisible en tráfico HTML de Reverse Proxy.
+ * H-06: Reverse Proxy streaming nativo con http.request / https.request.
+ * Conserva Buffer binario sin corrupción, reenvía Cookie/Authorization/Set-Cookie/Cache-Control,
+ * NO sigue redirecciones 301/302 automáticamente, y la inyección DOM canario es opt-in (H-04).
  */
-async function proxyToProtectedTarget({ req, res, targetBaseUrl, reqUrl, bodyText }) {
-  const destination = new URL(reqUrl.pathname + reqUrl.search, targetBaseUrl);
-  const forwardHeaders = {
-    'User-Agent': req.headers['user-agent'] || 'GuardianesEternos-Shield/2.0',
-    Accept: req.headers['accept'] || '*/*'
-  };
-  if (req.headers['content-type']) {
-    forwardHeaders['Content-Type'] = req.headers['content-type'];
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
-
-  try {
-    const upstream = await fetch(destination.toString(), {
-      method: req.method,
-      headers: forwardHeaders,
-      body: ['GET', 'HEAD'].includes(req.method) ? undefined : bodyText || undefined,
-      signal: controller.signal
-    });
-
-    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
-    const securityHeaders = {
-      'Content-Type': contentType,
-      'X-Protected-By': 'Guardianes-Eternos-Swarm-WAF/2.0',
-      'X-Content-Type-Options': 'nosniff',
-      'X-Frame-Options': 'SAMEORIGIN',
-      'Referrer-Policy': 'strict-origin-when-cross-origin',
-      'Permissions-Policy': 'geolocation=(), microphone=(), camera=()'
-    };
-
-    if (contentType.includes('text/html')) {
-      let html = await upstream.text();
-      const stealthCanary =
-        '<a href="/api/v1/internal/admin-keys" style="position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden;opacity:0" tabindex="-1" aria-hidden="true">Internal Admin Vault</a>' +
-        '<script src="/guardianes-sensor.js" defer></script>';
-      if (html.includes('</body>')) {
-        html = html.replace('</body>', `${stealthCanary}</body>`);
-      } else {
-        html += stealthCanary;
-      }
-      res.writeHead(upstream.status, securityHeaders);
-      res.end(html);
+function proxyToProtectedTarget({
+  req,
+  res,
+  targetBaseUrl,
+  reqUrl,
+  rawBodyBuffer,
+  injectDomCanary = false
+}) {
+  return new Promise((resolve) => {
+    let destination;
+    try {
+      destination = new URL(reqUrl.pathname + reqUrl.search, targetBaseUrl);
+    } catch {
+      sendJson(res, 502, { error: 'Upstream target configuration invalid.' });
+      resolve();
       return;
     }
 
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    res.writeHead(upstream.status, securityHeaders);
-    res.end(buf);
-  } catch (err) {
-    sendJson(res, 502, {
-      error: 'No se pudo conectar con el servidor protegido aguas arriba.',
-      detail: err.message
+    const isHttps = destination.protocol === 'https:';
+    const transport = isHttps ? https : http;
+
+    const forwardHeaders = {};
+    for (const [k, v] of Object.entries(req.headers || {})) {
+      const lower = k.toLowerCase();
+      if (HOP_BY_HOP_HEADERS.has(lower) || lower === 'host') continue;
+      if (v !== undefined) forwardHeaders[k] = v;
+    }
+    forwardHeaders.host = destination.host;
+    if (rawBodyBuffer && rawBodyBuffer.length > 0) {
+      forwardHeaders['content-length'] = String(rawBodyBuffer.length);
+    }
+
+    const upstreamReq = transport.request(
+      {
+        protocol: destination.protocol,
+        hostname: destination.hostname,
+        port: destination.port || (isHttps ? 443 : 80),
+        path: destination.pathname + destination.search,
+        method: req.method,
+        headers: forwardHeaders,
+        timeout: 10_000
+      },
+      (upstreamRes) => {
+        const resHeaders = {};
+        for (const [k, v] of Object.entries(upstreamRes.headers || {})) {
+          const lower = k.toLowerCase();
+          if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+          if (v !== undefined) resHeaders[k] = v;
+        }
+
+        // Cabeceras de blindaje defensivo sin sobrescribir Cache-Control ni Set-Cookie del upstream
+        resHeaders['X-Protected-By'] = 'Guardianes-Eternos-Swarm-WAF/5.0';
+        resHeaders['X-Content-Type-Options'] = resHeaders['x-content-type-options'] || 'nosniff';
+        resHeaders['X-Frame-Options'] = resHeaders['x-frame-options'] || 'SAMEORIGIN';
+        resHeaders['Referrer-Policy'] = resHeaders['referrer-policy'] || 'strict-origin-when-cross-origin';
+        resHeaders['Permissions-Policy'] =
+          resHeaders['permissions-policy'] || 'geolocation=(), microphone=(), camera=()';
+
+        const contentType = String(upstreamRes.headers['content-type'] || '');
+        const contentEncoding = String(upstreamRes.headers['content-encoding'] || '');
+        const shouldInjectHtml =
+          injectDomCanary &&
+          contentType.toLowerCase().includes('text/html') &&
+          !contentEncoding &&
+          upstreamRes.statusCode >= 200 &&
+          upstreamRes.statusCode < 300;
+
+        if (shouldInjectHtml) {
+          const chunks = [];
+          upstreamRes.on('data', (c) => chunks.push(c));
+          upstreamRes.on('end', () => {
+            let html = Buffer.concat(chunks).toString('utf8');
+            const stealthCanary =
+              '<a href="/api/v1/internal/admin-keys" rel="nofollow noopener" style="position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden;opacity:0" tabindex="-1" aria-hidden="true">Internal Admin Vault</a>' +
+              '<script src="/guardianes-sensor.js" defer></script>';
+            if (html.includes('</body>')) {
+              html = html.replace('</body>', `${stealthCanary}</body>`);
+            } else {
+              html += stealthCanary;
+            }
+            const outBuf = Buffer.from(html, 'utf8');
+            delete resHeaders['content-length'];
+            resHeaders['Content-Length'] = String(outBuf.length);
+            if (!res.writableEnded && !res.destroyed) {
+              res.writeHead(upstreamRes.statusCode || 200, resHeaders);
+              res.end(outBuf);
+            }
+            resolve();
+          });
+          upstreamRes.on('error', () => {
+            sendJson(res, 502, { error: 'Upstream response failed.' });
+            resolve();
+          });
+          return;
+        }
+
+        // Streaming directo sin tocar bytes (preserva binarios, imágenes, 302 redirects, Set-Cookie, etc.)
+        if (!res.writableEnded && !res.destroyed) {
+          res.writeHead(upstreamRes.statusCode || 200, resHeaders);
+          upstreamRes.pipe(res);
+          res.on('finish', resolve);
+          res.on('close', resolve);
+        } else {
+          upstreamRes.resume();
+          resolve();
+        }
+      }
+    );
+
+    upstreamReq.on('timeout', () => {
+      upstreamReq.destroy(new Error('Upstream timeout'));
     });
-  } finally {
-    clearTimeout(timer);
-  }
+
+    upstreamReq.on('error', () => {
+      // L-01: Error genérico al cliente sin filtrar stack ni err.message
+      sendJson(res, 502, { error: 'No se pudo conectar con el servidor protegido aguas arriba.' });
+      resolve();
+    });
+
+    if (rawBodyBuffer && rawBodyBuffer.length > 0 && !['GET', 'HEAD'].includes((req.method || 'GET').toUpperCase())) {
+      upstreamReq.write(rawBodyBuffer);
+    }
+    upstreamReq.end();
+  });
 }
 
 export function createGuardianesServer(options = {}) {
-  const memoryFilePath = options.memoryFilePath || DEFAULT_MEMORY_FILE;
+  const memoryFilePath = options.memoryFilePath !== undefined ? options.memoryFilePath : DEFAULT_MEMORY_FILE;
   const publicDir = options.publicDir || DEFAULT_PUBLIC_DIR;
   const dbPath = options.dbPath !== undefined ? options.dbPath : DEFAULT_DB_FILE;
 
@@ -226,11 +357,98 @@ export function createGuardianesServer(options = {}) {
     aiRouter.updateConfig({ tarpitDelayMs: options.aiConfig.tarpitDelayMs });
   }
 
+  // C-01: Token administrativo obligatorio (nunca bypass por 127.0.0.1)
+  let adminTokenHash = '';
+  let generatedAdminToken = null;
+  const configuredToken = options.adminToken || process.env.GUARDIANES_ADMIN_TOKEN || '';
+  if (configuredToken) {
+    adminTokenHash = sha256Hex(configuredToken);
+  } else {
+    const savedHash = store.loadSetting('admin_token_hash', null);
+    if (typeof savedHash === 'string' && savedHash.length === 64) {
+      adminTokenHash = savedHash;
+    } else {
+      generatedAdminToken = crypto.randomBytes(24).toString('hex');
+      adminTokenHash = sha256Hex(generatedAdminToken);
+      store.saveSetting('admin_token_hash', adminTokenHash);
+    }
+  }
+
+  const sessionHmacSecret = crypto.randomBytes(32);
+  const beaconHmacSecret = crypto.randomBytes(32);
+  const activeSessions = new Map(); // sessionId -> { csrfToken, expiresAt }
+
+  function signSessionId(sessionId) {
+    const mac = crypto.createHmac('sha256', sessionHmacSecret).update(sessionId).digest('hex');
+    return `${sessionId}.${mac}`;
+  }
+
+  function verifySignedSessionCookie(cookieVal) {
+    if (!cookieVal || typeof cookieVal !== 'string') return null;
+    const dot = cookieVal.indexOf('.');
+    if (dot <= 0) return null;
+    const sessionId = cookieVal.slice(0, dot);
+    const mac = cookieVal.slice(dot + 1);
+    const expected = crypto.createHmac('sha256', sessionHmacSecret).update(sessionId).digest('hex');
+    if (!timingSafeHexEquals(mac, expected)) return null;
+    const sess = activeSessions.get(sessionId);
+    if (!sess) return null;
+    if (Date.now() > sess.expiresAt) {
+      activeSessions.delete(sessionId);
+      return null;
+    }
+    return { sessionId, ...sess };
+  }
+
+  function verifyBearerOrHeaderToken(req) {
+    const authHeader = String(req.headers['authorization'] || '');
+    const customToken = String(req.headers['x-guardianes-admin-token'] || '');
+    const provided = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : customToken.trim();
+    if (!provided) return false;
+    return timingSafeHexEquals(sha256Hex(provided), adminTokenHash);
+  }
+
+  function issueBeaconNonce() {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = crypto.createHmac('sha256', beaconHmacSecret).update(`beacon:${ts}`).digest('hex').slice(0, 24);
+    return `${ts}.${sig}`;
+  }
+
+  function verifyBeaconNonce(nonce) {
+    if (!nonce || typeof nonce !== 'string') return false;
+    const dot = nonce.indexOf('.');
+    if (dot <= 0) return false;
+    const tsStr = nonce.slice(0, dot);
+    const sig = nonce.slice(dot + 1);
+    const ts = Number(tsStr);
+    if (!Number.isFinite(ts)) return false;
+    const ageSec = Math.abs(Math.floor(Date.now() / 1000) - ts);
+    if (ageSec > 600) return false;
+    const expected = crypto
+      .createHmac('sha256', beaconHmacSecret)
+      .update(`beacon:${tsStr}`)
+      .digest('hex')
+      .slice(0, 24);
+    return timingSafeHexEquals(sig, expected);
+  }
+
+  const extraHosts = String(process.env.GUARDIANES_ALLOWED_HOSTS || '')
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+  const allowedControlHosts = new Set([
+    'localhost',
+    '127.0.0.1',
+    '[::1]',
+    '::1',
+    ...extraHosts,
+    ...(options.allowedControlHosts || []).map((h) => String(h).toLowerCase())
+  ]);
+
   // Configuración del Escudo WAF y Reverse Proxy
   const savedShield = store.loadSetting('shield_config_public', null);
   const savedShieldSecrets = store.decryptSecretObject(store.loadSetting('shield_secrets_vault', null));
   const override = options.shieldConfigOverride || {};
-  const adminToken = options.adminToken || process.env.GUARDIANES_ADMIN_TOKEN || '';
 
   const shieldConfig = {
     protectedTargetUrl: override.protectedTargetUrl || savedShield?.protectedTargetUrl || 'https://www.365collaboration.net',
@@ -240,6 +458,16 @@ export function createGuardianesServer(options = {}) {
       override.trustProxyHeaders !== undefined
         ? Boolean(override.trustProxyHeaders)
         : Boolean(savedShield?.trustProxyHeaders),
+    trustedProxies:
+      Array.isArray(override.trustedProxies)
+        ? override.trustedProxies
+        : Array.isArray(savedShield?.trustedProxies)
+          ? savedShield.trustedProxies
+          : [...DEFAULT_TRUSTED_PROXIES],
+    injectDomCanary:
+      override.injectDomCanary !== undefined
+        ? Boolean(override.injectDomCanary)
+        : Boolean(savedShield?.injectDomCanary ?? false),
     wafRules: { ...DEFAULT_WAF_RULES, ...(savedShield?.wafRules || {}), ...(override.wafRules || {}) },
     webhookUrl: savedShield?.webhookUrl || '',
     webhookSecret: savedShieldSecrets?.webhookSecret || '',
@@ -252,6 +480,8 @@ export function createGuardianesServer(options = {}) {
       protectedTargetUrl: shieldConfig.protectedTargetUrl,
       shieldMode: shieldConfig.shieldMode,
       trustProxyHeaders: shieldConfig.trustProxyHeaders,
+      trustedProxies: [...shieldConfig.trustedProxies],
+      injectDomCanary: shieldConfig.injectDomCanary,
       wafRules: { ...shieldConfig.wafRules },
       webhookUrl: shieldConfig.webhookUrl,
       webhookSecretConfigured: Boolean(shieldConfig.webhookSecret),
@@ -259,7 +489,8 @@ export function createGuardianesServer(options = {}) {
       cloudflareZoneId: shieldConfig.cloudflareZoneId,
       cloudflareTokenConfigured: Boolean(shieldConfig.cloudflareApiToken),
       cloudflareTokenMasked: maskSecret(shieldConfig.cloudflareApiToken),
-      adminTokenEnabled: Boolean(adminToken)
+      adminTokenEnabled: true,
+      dualPlaneArchitecture: true
     };
   }
 
@@ -275,6 +506,13 @@ export function createGuardianesServer(options = {}) {
     }
     if (patch.trustProxyHeaders !== undefined) {
       shieldConfig.trustProxyHeaders = Boolean(patch.trustProxyHeaders);
+    }
+    if (patch.injectDomCanary !== undefined) {
+      shieldConfig.injectDomCanary = Boolean(patch.injectDomCanary);
+    }
+    if (Array.isArray(patch.trustedProxies)) {
+      const validProxies = patch.trustedProxies.map((p) => String(p).trim()).filter(isValidIpAddress);
+      if (validProxies.length > 0) shieldConfig.trustedProxies = validProxies;
     }
     if (patch.wafRules && typeof patch.wafRules === 'object') {
       for (const key of Object.keys(DEFAULT_WAF_RULES)) {
@@ -312,6 +550,8 @@ export function createGuardianesServer(options = {}) {
       protectedTargetUrl: shieldConfig.protectedTargetUrl,
       shieldMode: shieldConfig.shieldMode,
       trustProxyHeaders: shieldConfig.trustProxyHeaders,
+      trustedProxies: shieldConfig.trustedProxies,
+      injectDomCanary: shieldConfig.injectDomCanary,
       wafRules: shieldConfig.wafRules,
       webhookUrl: shieldConfig.webhookUrl,
       cloudflareZoneId: shieldConfig.cloudflareZoneId
@@ -330,13 +570,96 @@ export function createGuardianesServer(options = {}) {
   const memory = new SwarmMemory(memoryFilePath, store);
   const swarm = new SwarmCoordinator(aiRouter, memory, () => shieldConfig);
 
+  // H-07: Presupuesto adaptativo de sockets Tarpit para impedir DoS sobre tráfico legítimo
+  const maxTarpitSockets = Number.isFinite(Number(options.maxTarpitSockets))
+    ? Number(options.maxTarpitSockets)
+    : 1000;
+  const maxTarpitPerIp = Number.isFinite(Number(options.maxTarpitPerIp))
+    ? Number(options.maxTarpitPerIp)
+    : 2;
+  let activeTarpitSockets = 0;
+  const activeTarpitByIp = new Map();
+
+  async function streamTarpitWithBudget(req, res, ip, { trapPayload, labyrinthResponse }) {
+    const ipCount = activeTarpitByIp.get(ip) || 0;
+    const budgetExhausted = activeTarpitSockets >= maxTarpitSockets || ipCount >= maxTarpitPerIp;
+
+    const commonHeaders = {
+      'X-Kernel-Verification-Directive': trapPayload.headerDirective,
+      'X-Canary-Watermark': labyrinthResponse.canaryToken,
+      'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'no-store'
+    };
+
+    if (budgetExhausted) {
+      res.writeHead(403, {
+        'Content-Type': 'application/json; charset=utf-8',
+        ...commonHeaders
+      });
+      res.end(
+        JSON.stringify({
+          error: 'Access denied by perimeter shield.',
+          canary_watermark: labyrinthResponse.canaryToken
+        })
+      );
+      return;
+    }
+
+    activeTarpitSockets += 1;
+    activeTarpitByIp.set(ip, ipCount + 1);
+    memory.metrics.tarpitSocketsInUse = activeTarpitSockets;
+
+    let released = false;
+    const releaseSlot = () => {
+      if (released) return;
+      released = true;
+      activeTarpitSockets = Math.max(0, activeTarpitSockets - 1);
+      const cur = (activeTarpitByIp.get(ip) || 1) - 1;
+      if (cur <= 0) activeTarpitByIp.delete(ip);
+      else activeTarpitByIp.set(ip, cur);
+      memory.metrics.tarpitSocketsInUse = activeTarpitSockets;
+    };
+
+    res.on('close', releaseSlot);
+    res.on('finish', releaseSlot);
+
+    try {
+      res.writeHead(200, {
+        'Content-Type': labyrinthResponse.contentType,
+        ...commonHeaders
+      });
+
+      const totalDelay = Math.min(Math.max(0, labyrinthResponse.delayMs || 0), 60_000);
+      const chunks = labyrinthResponse.chunks || [labyrinthResponse.body];
+
+      if (totalDelay === 0 || chunks.length <= 1) {
+        res.end(labyrinthResponse.body);
+        return;
+      }
+
+      const stepDelay = Math.max(25, Math.floor(totalDelay / chunks.length));
+      for (let i = 0; i < chunks.length; i += 1) {
+        if (res.destroyed || req.destroyed) break;
+        res.write(chunks[i]);
+        if (i < chunks.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, stepDelay));
+        }
+      }
+      if (!res.destroyed && !res.writableEnded) {
+        res.end();
+      }
+    } finally {
+      releaseSlot();
+    }
+  }
+
   async function executeAndRecordCyberRange() {
     const cyberRange = await runLiveCyberRangeComparison(createGuardianesServer);
     memory.postDialogue({
       from: 'CHRONICLER',
       to: 'SWARM',
       severity: 'SUCCESS',
-      modelUsed: 'live-cyber-range-v3.1',
+      modelUsed: 'live-cyber-range-v5.0',
       message:
         `Campo de Tiro Real completado: Sin escudo = ${cyberRange.round1Summary.breachesSucceeded}/${cyberRange.round1Summary.totalAttacks} brechas críticas. ` +
         `Con Guardianes Eternos = ${cyberRange.round2Summary.trappedByGuardianes}/${cyberRange.round2Summary.totalAttacks} ataques atrapados, ` +
@@ -349,11 +672,11 @@ export function createGuardianesServer(options = {}) {
           ip: r.id === 'artex-ip-spoof' ? '185.220.101.47' : '198.51.100.210',
           path: r.payload.split('?')[0],
           rawUrl: r.payload,
-          userAgent: 'RedTeam-CyberRange/3.1',
-          headers: { 'x-sim-session': `range_${r.id}` },
+          userAgent: 'RedTeam-CyberRange/5.0',
+          headers: {},
           query: {}
         },
-        { skipDelay: true }
+        { skipDelay: true, internalActorKey: `sim:range_${r.id}` }
       );
     }
     return cyberRange;
@@ -377,101 +700,394 @@ export function createGuardianesServer(options = {}) {
       severity: 'INFO',
       modelUsed: 'deterministic-swarm-v1',
       message:
-        `Guardianes Eternos v3.1 Blindado en producción (${store.isMemory ? 'SQLite memoria' : 'SQLite disco'}). ` +
-        `42+ cebos canario por familia, WAF DPI multicapa y Byte-Drip Tarpit protegiendo ${shieldConfig.protectedTargetUrl}.`
+        `Guardianes Eternos v5.0 Dual-Plane activo (${store.isMemory ? 'SQLite memoria' : 'SQLite disco'}). ` +
+        `Capa de decepción, 43+ canarios, WAF DPI multicapa y Byte-Drip Tarpit adaptativo protegiendo ${shieldConfig.protectedTargetUrl}.`
     });
   }
 
-  const server = http.createServer(async (req, res) => {
+  // =========================================================================
+  // 1. DATA PLANE SERVER (Público / Tráfico protegido — SIN rutas de admin)
+  // =========================================================================
+  const dataServer = http.createServer(async (req, res) => {
     try {
       const safeRawUrl = String(req.url || '/').replace(/^\/+/, '/');
       const reqUrl = new URL(safeRawUrl, `http://${req.headers.host || 'localhost'}`);
       const cleanPath = reqUrl.pathname;
       const method = (req.method || 'GET').toUpperCase();
       const query = Object.fromEntries(reqUrl.searchParams.entries());
-      const { clientIp: ip, socketIp } = resolveClientIdentity(req, shieldConfig.trustProxyHeaders);
+      const { clientIp: ip, socketIp } = resolveClientIdentity(
+        req,
+        shieldConfig.trustProxyHeaders,
+        shieldConfig.trustedProxies
+      );
       const userAgent = String(req.headers['user-agent'] || '');
 
-      // 1. Sensor JS instalable para páginas reales
+      // 1A. Sensor JS con Nonce HMAC firmado por servidor (H-03, M-03)
       if (method === 'GET' && cleanPath === '/guardianes-sensor.js') {
         const origin = `http${req.socket.encrypted ? 's' : ''}://${req.headers.host || '127.0.0.1:4040'}`;
         res.writeHead(200, {
           'Content-Type': 'application/javascript; charset=utf-8',
           'X-Content-Type-Options': 'nosniff',
-          'Cache-Control': 'public, max-age=300'
+          'Cache-Control': 'no-store'
         });
-        res.end(buildSensorScript(origin));
+        res.end(
+          buildSensorScript(origin, {
+            sensorNonce: issueBeaconNonce(),
+            injectTrapLink: shieldConfig.injectDomCanary
+          })
+        );
         return;
       }
 
-      // 2. robots.txt con cebos silenciosos para crawlers agresivos
+      // 1B. robots.txt completo bloqueando TODOS los canarios para proteger SEO (H-04)
       if (method === 'GET' && cleanPath === '/robots.txt') {
+        const allCanaries = Array.from(new Set([...CANARY_PATHS, ...hermes.customCanaries]));
         const robotsTxt = [
           'User-agent: *',
           'Allow: /',
-          '# Legacy staging archives (do not index)',
-          ...CANARY_PATHS.slice(0, 10).map((p) => `Disallow: ${p}`)
+          '# Legacy & internal canary routes (do not index)',
+          ...allCanaries.map((p) => `Disallow: ${p}`)
         ].join('\n');
-        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.writeHead(200, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff'
+        });
         res.end(robotsTxt);
         return;
       }
 
-      // 3. Control Plane API & Ruta dedicada /soc (protege / cuando actúa como Reverse Proxy o lleva query)
-      const isProtectedRoot =
-        cleanPath === '/' && (shieldConfig.shieldMode === 'reverse-proxy' || reqUrl.search !== '');
-      const isControlPlane =
-        cleanPath.startsWith('/api/guardianes/') ||
-        cleanPath === '/soc' ||
-        cleanPath === '/soc/' ||
-        cleanPath === '/index.html' ||
-        (cleanPath === '/' && !isProtectedRoot);
+      // 1C. Preflight CORS + Telemetry Beacon con Nonce firmado (H-03, M-03)
+      if (cleanPath === '/telemetry-beacon') {
+        const corsHeaders = {
+          'Access-Control-Allow-Origin': req.headers.origin ? String(req.headers.origin) : '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+          'Access-Control-Max-Age': '600'
+        };
 
-      let bodyText = '';
-      if (!isControlPlane && ['POST', 'PUT', 'PATCH'].includes(method)) {
-        bodyText = await readRawBody(req, MAX_DPI_BODY_BYTES);
+        if (method === 'OPTIONS') {
+          res.writeHead(204, corsHeaders);
+          res.end();
+          return;
+        }
+
+        if (method === 'POST') {
+          const rawBuf = await readBodyBuffer(req, 16 * 1024);
+          let body = {};
+          try {
+            body = JSON.parse(rawBuf.toString('utf8') || '{}');
+          } catch {
+            sendJson(res, 400, { error: 'Invalid telemetry payload.' }, corsHeaders);
+            return;
+          }
+
+          if (!verifyBeaconNonce(body.nonce)) {
+            sendJson(res, 403, { error: 'Invalid or expired sensor nonce.' }, corsHeaders);
+            return;
+          }
+
+          // H-03: El beacon solo añade riesgo pasivo (+35) y telemetría; NUNCA cuarentena una IP por sí solo.
+          const actorKey = `ip:${ip}`;
+          const existing = memory.threatGraph.get(actorKey);
+          const nextScore = Math.min(80, Math.max(existing?.riskScore || 0, 35));
+          memory.recordThreatInteraction({
+            actorKey,
+            ip,
+            userAgent: String(body.ua || userAgent).slice(0, 180),
+            signature: existing?.signature || 'Headless-Browser-Sensor-Signal',
+            riskScore: nextScore,
+            pathVisited: String(body.href || '/').slice(0, 180),
+            status: existing?.quarantined ? 'QUARANTINED' : 'SIGNAL_RECORDED',
+            tokensBurned: 0,
+            attackVectors: ['HEADLESS_WEBDRIVER_SENSOR'],
+            quarantined: Boolean(existing?.quarantined)
+          });
+          sendJson(res, 200, { ok: true, signalRecorded: true, quarantined: Boolean(existing?.quarantined) }, corsHeaders);
+          return;
+        }
       }
 
-      // 4. Inspección de Defensa Activa: Centinela (WAF DPI Multicapa + Canarios + Anti-Spoofing)
-      if (!isControlPlane) {
-        const defenseOutcome = await swarm.handleIncomingRequest({
+      // 1D. Sidecar Endpoint para nginx auth_request (Pilar 3 / H-06)
+      if (cleanPath === '/guardianes/check' && (method === 'GET' || method === 'HEAD')) {
+        const origRaw = String(req.headers['x-original-uri'] || '/').replace(/^\/+/, '/');
+        const origUrl = new URL(origRaw, 'http://localhost');
+        const inspection = swarm.sentinel.inspect({
           ip,
           socketIp,
-          path: cleanPath,
-          rawUrl: reqUrl.pathname + reqUrl.search,
+          path: origUrl.pathname,
+          rawUrl: origUrl.pathname + origUrl.search,
           userAgent,
           headers: req.headers,
-          query,
-          bodyText
+          bodyText: '',
+          wafRules: shieldConfig.wafRules,
+          customCanaries: shieldConfig.customCanaries || [],
+          customKeywords: shieldConfig.customKeywords || []
         });
 
-        if (defenseOutcome.intercepted) {
-          await streamTarpitResponse(req, res, defenseOutcome);
-          return;
-        }
-
-        // Si el tráfico es legítimo y está activo el Reverse Proxy Shield, reenviar blindado
-        if (shieldConfig.shieldMode === 'reverse-proxy') {
-          await proxyToProtectedTarget({
-            req,
-            res,
-            targetBaseUrl: shieldConfig.protectedTargetUrl,
-            reqUrl,
-            bodyText
+        if (inspection.isThreat) {
+          res.writeHead(403, {
+            'X-Guardianes-Decision': 'BLOCK',
+            'X-Guardianes-Vectors': (inspection.attackVectors || []).join(','),
+            'Cache-Control': 'no-store'
           });
+          res.end();
+          return;
+        }
+        res.writeHead(200, {
+          'X-Guardianes-Decision': 'ALLOW',
+          'Cache-Control': 'no-store'
+        });
+        res.end();
+        return;
+      }
+
+      // 1E. Leer cuerpo en TODOS los métodos que puedan traer carga (incluyendo DELETE - H-01 / H-06)
+      let rawBodyBuffer = Buffer.alloc(0);
+      if (!['GET', 'HEAD'].includes(method)) {
+        rawBodyBuffer = await readBodyBuffer(req, MAX_PROXY_BODY_BYTES);
+      }
+      const dpiBodyText =
+        rawBodyBuffer.length > 0
+          ? rawBodyBuffer.subarray(0, MAX_DPI_INSPECT_BYTES).toString('utf8')
+          : '';
+
+      // 1F. Inspección de Defensa Activa (Centinela WAF DPI + Canarios + Cuarentena dedicada)
+      const defenseOutcome = await swarm.handleIncomingRequest({
+        ip,
+        socketIp,
+        path: cleanPath,
+        rawUrl: reqUrl.pathname + reqUrl.search,
+        userAgent,
+        headers: req.headers,
+        query,
+        bodyText: dpiBodyText
+      });
+
+      if (defenseOutcome.intercepted) {
+        await streamTarpitWithBudget(req, res, ip, defenseOutcome);
+        return;
+      }
+
+      // 1G. Reverse Proxy Streaming hacia servidor protegido (H-06)
+      if (shieldConfig.shieldMode === 'reverse-proxy') {
+        await proxyToProtectedTarget({
+          req,
+          res,
+          targetBaseUrl: shieldConfig.protectedTargetUrl,
+          reqUrl,
+          rawBodyBuffer,
+          injectDomCanary: shieldConfig.injectDomCanary
+        });
+        return;
+      }
+
+      // Respuesta limpia de Data Plane standalone (sin exponer SOC ni APIs de administración)
+      sendJson(res, 200, {
+        status: 'ok',
+        perimeter: 'Guardianes Eternos Data Plane v5.0',
+        protected: true
+      });
+    } catch (err) {
+      const status = err?.message === 'Payload too large' ? 413 : 500;
+      const clientMsg = status === 413 ? 'Payload too large.' : 'Internal Server Error.';
+      sendJson(res, status, { error: clientMsg });
+    }
+  });
+
+  // =========================================================================
+  // 2. CONTROL PLANE SERVER (Solo loopback + Auth obligatoria + CSRF + SSE)
+  // =========================================================================
+  const sseClients = new Set();
+  const onMemoryDelta = (delta) => {
+    if (sseClients.size === 0) return;
+    const frame = `event: ${delta.type}\ndata: ${JSON.stringify(delta)}\n\n`;
+    for (const clientRes of sseClients) {
+      if (clientRes.destroyed || clientRes.writableEnded) {
+        sseClients.delete(clientRes);
+        continue;
+      }
+      try {
+        clientRes.write(frame);
+      } catch {
+        sseClients.delete(clientRes);
+      }
+    }
+  };
+  memory.on('delta', onMemoryDelta);
+
+  const sseHeartbeat = setInterval(() => {
+    for (const clientRes of sseClients) {
+      if (clientRes.destroyed || clientRes.writableEnded) {
+        sseClients.delete(clientRes);
+        continue;
+      }
+      try {
+        clientRes.write(': ping\n\n');
+      } catch {
+        sseClients.delete(clientRes);
+      }
+    }
+  }, 20_000);
+  if (typeof sseHeartbeat.unref === 'function') sseHeartbeat.unref();
+
+  const controlServer = http.createServer(async (req, res) => {
+    try {
+      // C-02: Protección anti-DNS Rebinding mediante lista blanca estricta de Host
+      if (!isAllowedControlHost(req.headers.host, allowedControlHosts)) {
+        sendJson(res, 421, { error: 'Misdirected Request: Host no permitido en el Control Plane.' });
+        return;
+      }
+
+      const safeRawUrl = String(req.url || '/').replace(/^\/+/, '/');
+      const reqUrl = new URL(safeRawUrl, `http://${req.headers.host}`);
+      const cleanPath = reqUrl.pathname;
+      const method = (req.method || 'GET').toUpperCase();
+      const cookies = parseCookies(req.headers.cookie || '');
+      const session = verifySignedSessionCookie(cookies.guardianes_session);
+      const hasBearer = verifyBearerOrHeaderToken(req);
+
+      const isMutating = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
+
+      // C-02: En todas las rutas mutantes, validar Origin/Sec-Fetch-Site (403) y Content-Type: application/json (415)
+      if (isMutating) {
+        if (!isSafeControlOrigin(req, allowedControlHosts)) {
+          sendJson(res, 403, { error: 'Forbidden: origen cross-site bloqueado por política anti-CSRF.' });
+          return;
+        }
+        const ct = String(req.headers['content-type'] || '').toLowerCase();
+        if (!ct.includes('application/json')) {
+          sendJson(res, 415, { error: 'Unsupported Media Type: se requiere Content-Type: application/json.' });
           return;
         }
       }
 
-      // Guardián de Autenticación Administrativa para el Control Plane (excluyendo telemetría pública)
-      if (cleanPath.startsWith('/api/guardianes/') && cleanPath !== '/api/guardianes/telemetry-beacon') {
-        if (!isAuthorizedControlRequest(req, socketIp, adminToken)) {
-          sendJson(res, 401, { error: 'No autorizado: se requiere acceso local o GUARDIANES_ADMIN_TOKEN válido.' });
+      // 2A. Endpoints de Autenticación del Control Plane
+      if (cleanPath === '/api/auth/login' && method === 'POST') {
+        const body = await readJsonBody(req);
+        const token = String(body.token || '').trim();
+        if (!token || !timingSafeHexEquals(sha256Hex(token), adminTokenHash)) {
+          sendJson(res, 401, { error: 'Credenciales inválidas.' });
           return;
+        }
+        const sessionId = crypto.randomBytes(24).toString('hex');
+        const csrfToken = crypto.randomBytes(24).toString('hex');
+        activeSessions.set(sessionId, {
+          csrfToken,
+          expiresAt: Date.now() + 12 * 3600 * 1000
+        });
+        const signedCookie = signSessionId(sessionId);
+        sendJson(
+          res,
+          200,
+          { ok: true, authenticated: true, csrfToken },
+          {
+            'Set-Cookie': `guardianes_session=${encodeURIComponent(signedCookie)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`
+          }
+        );
+        return;
+      }
+
+      if (cleanPath === '/api/auth/session' && method === 'GET') {
+        if (hasBearer) {
+          sendJson(res, 200, { ok: true, authenticated: true, authMode: 'bearer', csrfToken: null });
+          return;
+        }
+        if (session) {
+          sendJson(res, 200, { ok: true, authenticated: true, authMode: 'cookie', csrfToken: session.csrfToken });
+          return;
+        }
+        sendJson(res, 200, { ok: true, authenticated: false });
+        return;
+      }
+
+      if (cleanPath === '/api/auth/logout' && method === 'POST') {
+        if (session) activeSessions.delete(session.sessionId);
+        sendJson(
+          res,
+          200,
+          { ok: true, authenticated: false },
+          {
+            'Set-Cookie': 'guardianes_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'
+          }
+        );
+        return;
+      }
+
+      // 2B. Archivos estáticos de la UI del SOC (index.html y /soc3d/soc3d.js)
+      if (
+        method === 'GET' &&
+        (cleanPath === '/' || cleanPath === '/index.html' || cleanPath === '/soc' || cleanPath === '/soc/')
+      ) {
+        const targetFile = path.resolve(publicDir, 'index.html');
+        if (!targetFile.startsWith(path.resolve(publicDir))) {
+          sendJson(res, 403, { error: 'Forbidden' });
+          return;
+        }
+        const html = fs.readFileSync(targetFile, 'utf8');
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff',
+          'X-Frame-Options': 'SAMEORIGIN',
+          'Referrer-Policy': 'no-referrer'
+        });
+        res.end(html);
+        return;
+      }
+
+      if (method === 'GET' && cleanPath === '/soc3d/soc3d.js') {
+        const targetFile = path.resolve(publicDir, 'soc3d', 'soc3d.js');
+        if (!targetFile.startsWith(path.resolve(publicDir)) || !fs.existsSync(targetFile)) {
+          sendJson(res, 404, { error: 'Not Found' });
+          return;
+        }
+        const js = fs.readFileSync(targetFile, 'utf8');
+        res.writeHead(200, {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'no-cache'
+        });
+        res.end(js);
+        return;
+      }
+
+      // 2C. Barrera de Autenticación Obligatoria para /events y /api/guardianes/* (C-01 & C-02)
+      if (cleanPath === '/events' || cleanPath.startsWith('/api/guardianes/')) {
+        if (!hasBearer && !session) {
+          sendJson(res, 401, { error: 'No autorizado: inicia sesión o envía Authorization: Bearer <token>.' });
+          return;
+        }
+        // Si autentica por cookie en método mutante, exige cabecera X-CSRF-Token válida
+        if (isMutating && !hasBearer) {
+          const providedCsrf = String(req.headers['x-csrf-token'] || '');
+          if (!timingSafeHexEquals(providedCsrf, session.csrfToken)) {
+            sendJson(res, 403, { error: 'Forbidden: token X-CSRF-Token inválido o ausente.' });
+            return;
+          }
         }
       }
 
-      // 5. Endpoints de Operaciones del Centro de Mando
+      // 2D. Stream Server-Sent Events (SSE) en tiempo real para el SOC Holográfico 3D
+      if (cleanPath === '/events' && method === 'GET') {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-transform',
+          Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no'
+        });
+        sseClients.add(res);
+        res.write(
+          `event: hello\ndata: ${JSON.stringify({
+            timestamp: new Date().toISOString(),
+            metrics: memory.metrics
+          })}\n\n`
+        );
+        req.on('close', () => {
+          sseClients.delete(res);
+        });
+        return;
+      }
+
+      // 2E. Endpoints de Operaciones del Centro de Mando
       if (cleanPath === '/api/guardianes/state' && method === 'GET') {
         sendJson(res, 200, {
           ok: true,
@@ -492,7 +1108,11 @@ export function createGuardianesServer(options = {}) {
 
       if (cleanPath === '/api/guardianes/hermes/chat' && method === 'POST') {
         const body = await readJsonBody(req);
-        const turn = await hermes.chat(body.message);
+        const turn = await hermes.chat(body.message || '', {
+          confirm: Boolean(body.confirm),
+          cancel: Boolean(body.cancel),
+          confirmationId: body.confirmationId || null
+        });
         sendJson(res, 200, {
           ok: true,
           turn,
@@ -510,32 +1130,6 @@ export function createGuardianesServer(options = {}) {
           ...result,
           ai: aiRouter.getPublicConfig()
         });
-        return;
-      }
-
-      if (cleanPath === '/api/guardianes/telemetry-beacon' && method === 'POST') {
-        const body = await readJsonBody(req);
-        const actorKey = `ip:${ip}`;
-        const { entry } = memory.recordThreatInteraction({
-          actorKey,
-          ip,
-          userAgent: String(body.ua || userAgent),
-          signature: 'Headless-Browser-Sensor',
-          riskScore: 94,
-          pathVisited: String(body.href || '/'),
-          status: 'QUARANTINED',
-          tokensBurned: 0,
-          attackVectors: ['HEADLESS_WEBDRIVER_SENSOR'],
-          quarantined: true
-        });
-        memory.postDialogue({
-          from: 'SENTINEL',
-          to: 'CHRONICLER',
-          severity: 'CRITICAL',
-          modelUsed: 'browser-sensor-v2',
-          message: `Sensor JS detectó navegador automatizado (WebDriver) desde ${ip}. IP puesta en CUARENTENA ACTIVA.`
-        });
-        sendJson(res, 200, { ok: true, quarantined: entry.quarantined });
         return;
       }
 
@@ -565,7 +1159,7 @@ export function createGuardianesServer(options = {}) {
           from: 'SENTINEL',
           to: 'SWARM',
           severity: 'INFO',
-          modelUsed: 'waf-dpi-engine-v2',
+          modelUsed: 'waf-dpi-engine-v5',
           message: `Escudo WAF actualizado: objetivo ${updatedShield.protectedTargetUrl} (${updatedShield.shieldMode}).`
         });
         sendJson(res, 200, {
@@ -585,11 +1179,12 @@ export function createGuardianesServer(options = {}) {
           return;
         }
         const updated = memory.setQuarantine(target, quarantined);
+        memory.flushNow();
         memory.postDialogue({
           from: 'SENTINEL',
           to: 'SWARM',
           severity: quarantined ? 'CRITICAL' : 'INFO',
-          modelUsed: 'waf-dpi-engine-v2',
+          modelUsed: 'waf-dpi-engine-v5',
           message: quarantined
             ? `Operador activó CUARENTENA manual para ${target}.`
             : `Operador liberó de cuarentena a ${target}.`
@@ -631,9 +1226,9 @@ export function createGuardianesServer(options = {}) {
       }
 
       if (cleanPath === '/api/guardianes/deploy-kit' && method === 'GET') {
-        const origin = `http${req.socket.encrypted ? 's' : ''}://${req.headers.host || '127.0.0.1:4040'}`;
+        const dataOrigin = `http://${process.env.DATA_PUBLIC_HOST || '127.0.0.1:4040'}`;
         const kit = buildDeployKit({
-          guardianBaseUrl: origin,
+          guardianBaseUrl: dataOrigin,
           protectedTargetUrl: shieldConfig.protectedTargetUrl
         });
         sendJson(res, 200, { ok: true, kit });
@@ -643,6 +1238,7 @@ export function createGuardianesServer(options = {}) {
       if (cleanPath === '/api/guardianes/audit' && method === 'POST') {
         const body = await readJsonBody(req);
         const audit = await swarm.runAuditPentest(typeof body.mode === 'string' ? body.mode : 'full-audit');
+        memory.flushNow();
         sendJson(res, 200, {
           ok: true,
           audit,
@@ -655,6 +1251,7 @@ export function createGuardianesServer(options = {}) {
         const body = await readJsonBody(req);
         const scenario = typeof body.scenario === 'string' ? body.scenario : 'artex';
         const simulation = await swarm.runSimulation(scenario);
+        memory.flushNow();
         sendJson(res, 200, {
           ok: true,
           simulation,
@@ -665,6 +1262,7 @@ export function createGuardianesServer(options = {}) {
 
       if (cleanPath === '/api/guardianes/cyber-range' && method === 'POST') {
         const cyberRange = await executeAndRecordCyberRange();
+        memory.flushNow();
         sendJson(res, 200, {
           ok: true,
           cyberRange,
@@ -691,7 +1289,7 @@ export function createGuardianesServer(options = {}) {
           to: 'SWARM',
           severity: 'INFO',
           modelUsed: 'deterministic-swarm-v1',
-          message: 'Sesión y base SQLite de amenazas limpiadas. 42 cebos canario y WAF DPI vigilando.'
+          message: 'Sesión y base SQLite de amenazas limpiadas. 43+ cebos canario y WAF DPI vigilando.'
         });
         sendJson(res, 200, {
           ok: true,
@@ -700,53 +1298,110 @@ export function createGuardianesServer(options = {}) {
         return;
       }
 
-      // 6. Centro de Mando Visual (/soc siempre accesible aunque / sea Reverse Proxy)
-      if (
-        method === 'GET' &&
-        (cleanPath === '/' || cleanPath === '/index.html' || cleanPath === '/soc' || cleanPath === '/soc/')
-      ) {
-        const targetFile = path.resolve(publicDir, 'index.html');
-        if (!targetFile.startsWith(path.resolve(publicDir))) {
-          sendJson(res, 403, { error: 'Forbidden' });
-          return;
-        }
-        const html = fs.readFileSync(targetFile, 'utf8');
-        res.writeHead(200, {
-          'Content-Type': 'text/html; charset=utf-8',
-          'X-Content-Type-Options': 'nosniff',
-          'X-Frame-Options': 'SAMEORIGIN'
-        });
-        res.end(html);
-        return;
-      }
-
-      sendJson(res, 404, { error: 'Ruta no encontrada en el perímetro público.' });
+      sendJson(res, 404, { error: 'Endpoint no encontrado en el Control Plane.' });
     } catch (err) {
       const status =
-        err.message === 'Payload too large' ? 413 : err.message === 'Invalid JSON body' ? 400 : 500;
-      sendJson(res, status, { error: err.message || 'Internal Server Error' });
+        err?.message === 'Payload too large'
+          ? 413
+          : err?.message === 'Invalid JSON body'
+            ? 400
+            : 500;
+      const clientMsg =
+        status === 413
+          ? 'Payload too large.'
+          : status === 400
+            ? 'Invalid JSON body.'
+            : 'Internal Server Error.';
+      sendJson(res, status, { error: clientMsg });
     }
   });
 
-  server.on('close', () => {
+  // Hardening HTTP timeouts en ambos servidores (H-07)
+  for (const srv of [dataServer, controlServer]) {
+    srv.headersTimeout = 10_000;
+    srv.requestTimeout = 70_000;
+    srv.keepAliveTimeout = 5_000;
+    srv.maxConnections = 2000;
+  }
+
+  let cleanedUp = false;
+  function cleanupResources() {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    clearInterval(sseHeartbeat);
+    memory.off('delta', onMemoryDelta);
+    for (const c of sseClients) {
+      try {
+        c.end();
+      } catch {
+        // ignore
+      }
+    }
+    sseClients.clear();
+    memory.stopTimers();
     try {
       store.close();
     } catch {
-      // ignora cierre repetido
+      // ignore
     }
-  });
+  }
 
-  return { server, store, aiRouter, memory, swarm, hermes };
+  async function closeAll() {
+    await Promise.all([
+      new Promise((resolve) => (dataServer.listening ? dataServer.close(() => resolve()) : resolve())),
+      new Promise((resolve) => (controlServer.listening ? controlServer.close(() => resolve()) : resolve()))
+    ]);
+    cleanupResources();
+  }
+
+  // Si alguien cierra el servidor directamente sin closeAll(), aseguramos limpieza si ambos están cerrados
+  const maybeCleanup = () => {
+    if (!dataServer.listening && !controlServer.listening) {
+      cleanupResources();
+    }
+  };
+  dataServer.on('close', maybeCleanup);
+  controlServer.on('close', maybeCleanup);
+
+  return {
+    dataServer,
+    controlServer,
+    server: dataServer,
+    store,
+    aiRouter,
+    memory,
+    swarm,
+    hermes,
+    generatedAdminToken,
+    issueBeaconNonce,
+    closeAll
+  };
 }
 
 const isDirectExecution =
   process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename);
 
 if (isDirectExecution) {
-  const port = Number(process.env.PORT) || 4040;
-  const { server } = createGuardianesServer();
-  server.listen(port, '127.0.0.1', () => {
-    console.log(`🛡️  Guardianes Eternos v4.0 (Comandante Hermes + WAF SOC) activo en http://127.0.0.1:${port}`);
-    console.log('⚡  Hermes Anti-Prompt-Injection + SQLite Nativo + WAF DPI + Byte-Drip Tarpit listos.');
+  const dataPort = Number(process.env.PORT) || 4040;
+  const controlPort = Number(process.env.CONTROL_PORT) || 4041;
+  const dataHost = process.env.DATA_HOST || '127.0.0.1';
+  const controlHost = process.env.CONTROL_HOST || '127.0.0.1';
+
+  const { dataServer, controlServer, generatedAdminToken } = createGuardianesServer();
+
+  dataServer.listen(dataPort, dataHost, () => {
+    console.log(`🛡️  Guardianes Eternos v5.0 [DATA PLANE]    activo en http://${dataHost}:${dataPort}`);
+  });
+
+  controlServer.listen(controlPort, controlHost, () => {
+    console.log(`🎛️  Guardianes Eternos v5.0 [CONTROL PLANE] activo en http://${controlHost}:${controlPort}`);
+    if (generatedAdminToken) {
+      console.log(`🔑  [PRIMER ARRANQUE] Admin Token generado (guárdalo ahora, solo se muestra una vez):`);
+      console.log(`    GUARDIANES_ADMIN_TOKEN=${generatedAdminToken}`);
+    } else if (process.env.GUARDIANES_ADMIN_TOKEN) {
+      console.log('🔐  Admin Token cargado desde variable de entorno GUARDIANES_ADMIN_TOKEN.');
+    } else {
+      console.log('🔐  Admin Token cargado desde hash persistido en SQLite.');
+    }
   });
 }

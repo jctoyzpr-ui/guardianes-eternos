@@ -1,7 +1,7 @@
 {
   "name": "guardianes-eternos",
-  "version": "1.0.0",
-  "description": "Eternal Guardians — Swarm Cyber Deception, AI Tarpit & Defensive Indirect Prompt Injection Framework (MIT Open Source)",
+  "version": "5.0.0",
+  "description": "Eternal Guardians v5.0 — Dual-Plane Cyber Deception, WAF DPI, Adaptive Tarpit & Three.js Holographic 3D SOC (MIT Open Source)",
   "main": "src/server.js",
   "type": "module",
   "license": "MIT",

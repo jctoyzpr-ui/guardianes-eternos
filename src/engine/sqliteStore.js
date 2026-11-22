@@ -1,7 +1,10 @@
 /**
- * @fileoverview Persistencia real en SQLite nativo (node:sqlite / DatabaseSync).
- * Almacena amenazas, cuarentenas de IPs, diálogos del enjambre, reportes ejecutivos
- * y configuración protegida con cifrado AES-256-GCM para llaves/tokens sensibles.
+ * @fileoverview Persistencia real en SQLite nativo (node:sqlite / DatabaseSync) — v5.0.
+ * Incluye:
+ *  - Tabla dedicada `quarantines` con TTL (H-02).
+ *  - Llave maestra vía GUARDIANES_VAULT_KEY + versionado `kid` (M-02).
+ *  - Escritura por lotes en transacción única `flushBatch` (H-07).
+ *  - Poda de retención de logs `pruneOldLogs` (M-01).
  */
 
 import crypto from 'node:crypto';
@@ -24,25 +27,43 @@ export class SQLiteStore {
     this.db = new DatabaseSync(dbPath);
     if (!this.isMemory) {
       this.db.exec('PRAGMA journal_mode = WAL;');
+      this.db.exec('PRAGMA synchronous = NORMAL;');
     }
     this.db.exec('PRAGMA busy_timeout = 3000;');
+
+    this._vaultKid = 'v1';
     this._vaultKey = this._initVaultKey();
     this._initSchema();
   }
 
   _initVaultKey() {
+    // M-02: Prioriza variable de entorno GUARDIANES_VAULT_KEY sobre archivo en disco
+    const envKey = process.env.GUARDIANES_VAULT_KEY;
+    if (envKey && /^[0-9a-f]{64}$/i.test(envKey.trim())) {
+      this._vaultKid = 'env-v1';
+      return Buffer.from(envKey.trim(), 'hex');
+    }
+    if (envKey && envKey.trim().length >= 16) {
+      this._vaultKid = 'env-sha256-v1';
+      return crypto.createHash('sha256').update(envKey.trim()).digest();
+    }
+
     if (this.isMemory) {
+      this._vaultKid = 'mem-v1';
       return crypto.randomBytes(32);
     }
+
     const keyPath = path.join(path.dirname(this.dbPath), '.vault.key');
     if (fs.existsSync(keyPath)) {
       const hex = fs.readFileSync(keyPath, 'utf8').trim();
       if (/^[0-9a-f]{64}$/i.test(hex)) {
+        this._vaultKid = 'file-v1';
         return Buffer.from(hex, 'hex');
       }
     }
     const generated = crypto.randomBytes(32);
     fs.writeFileSync(keyPath, generated.toString('hex'), { encoding: 'utf8', mode: 0o600 });
+    this._vaultKid = 'file-v1';
     return generated;
   }
 
@@ -69,6 +90,15 @@ export class SQLiteStore {
         quarantined INTEGER NOT NULL DEFAULT 0
       );
 
+      CREATE TABLE IF NOT EXISTS quarantines (
+        ip_key TEXT PRIMARY KEY,
+        ip TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        hits INTEGER NOT NULL DEFAULT 1
+      );
+
       CREATE TABLE IF NOT EXISTS dialogue_logs (
         id TEXT PRIMARY KEY,
         timestamp TEXT NOT NULL,
@@ -93,6 +123,9 @@ export class SQLiteStore {
         key TEXT PRIMARY KEY,
         value_json TEXT NOT NULL
       );
+
+      CREATE INDEX IF NOT EXISTS idx_dialogue_ts ON dialogue_logs(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_quarantines_exp ON quarantines(expires_at);
     `);
 
     this._stmtUpsertThreat = this.db.prepare(`
@@ -121,6 +154,19 @@ export class SQLiteStore {
         quarantined = excluded.quarantined
     `);
 
+    this._stmtUpsertQuarantine = this.db.prepare(`
+      INSERT INTO quarantines (ip_key, ip, reason, expires_at, created_at, hits)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(ip_key) DO UPDATE SET
+        reason = excluded.reason,
+        expires_at = excluded.expires_at,
+        hits = excluded.hits
+    `);
+
+    this._stmtDeleteQuarantine = this.db.prepare(
+      'DELETE FROM quarantines WHERE ip_key = ? OR ip = ?'
+    );
+
     this._stmtInsertDialogue = this.db.prepare(`
       INSERT OR REPLACE INTO dialogue_logs (
         id, timestamp, sender, recipient, severity, model_used, message, metadata_json
@@ -148,6 +194,7 @@ export class SQLiteStore {
     const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     return {
+      kid: this._vaultKid,
       iv: iv.toString('hex'),
       tag: tag.toString('hex'),
       data: encrypted.toString('hex')
@@ -173,27 +220,78 @@ export class SQLiteStore {
     }
   }
 
+  /**
+   * H-07: Vacía un lote de amenazas, cuarentenas y diálogos en UNA sola transacción atómica.
+   */
+  flushBatch({ threats = [], quarantines = [], deletedQuarantines = [], dialogues = [] }) {
+    if (
+      threats.length === 0 &&
+      quarantines.length === 0 &&
+      deletedQuarantines.length === 0 &&
+      dialogues.length === 0
+    ) {
+      return;
+    }
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const entry of threats) {
+        this._stmtUpsertThreat.run(
+          entry.actorKey,
+          entry.ip,
+          entry.userAgent,
+          entry.signature,
+          entry.riskScore,
+          entry.status,
+          entry.firstSeen,
+          entry.lastSeen,
+          entry.totalHits,
+          entry.labyrinthDepth,
+          entry.timeWastedMs,
+          entry.estimatedAttackerTokensBurned,
+          entry.estimatedAttackerCostUsd,
+          JSON.stringify(entry.pathsVisited || []),
+          JSON.stringify(entry.appliedTraps || []),
+          JSON.stringify(entry.telemetryLeaked || []),
+          JSON.stringify(entry.attackVectors || []),
+          entry.quarantined ? 1 : 0
+        );
+      }
+
+      for (const q of quarantines) {
+        this._stmtUpsertQuarantine.run(q.ipKey, q.ip, q.reason, q.expiresAt, q.createdAt, q.hits || 1);
+      }
+
+      for (const target of deletedQuarantines) {
+        this._stmtDeleteQuarantine.run(target, target);
+      }
+
+      for (const item of dialogues) {
+        this._stmtInsertDialogue.run(
+          item.id,
+          item.timestamp,
+          item.from,
+          item.to,
+          item.severity,
+          item.modelUsed,
+          item.message,
+          JSON.stringify(item.metadata || {})
+        );
+      }
+
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    }
+  }
+
   upsertThreat(entry) {
-    this._stmtUpsertThreat.run(
-      entry.actorKey,
-      entry.ip,
-      entry.userAgent,
-      entry.signature,
-      entry.riskScore,
-      entry.status,
-      entry.firstSeen,
-      entry.lastSeen,
-      entry.totalHits,
-      entry.labyrinthDepth,
-      entry.timeWastedMs,
-      entry.estimatedAttackerTokensBurned,
-      entry.estimatedAttackerCostUsd,
-      JSON.stringify(entry.pathsVisited || []),
-      JSON.stringify(entry.appliedTraps || []),
-      JSON.stringify(entry.telemetryLeaked || []),
-      JSON.stringify(entry.attackVectors || []),
-      entry.quarantined ? 1 : 0
-    );
+    this.flushBatch({ threats: [entry] });
   }
 
   loadThreats(limit = 250) {
@@ -222,26 +320,35 @@ export class SQLiteStore {
     }));
   }
 
+  loadActiveQuarantines(nowMs = Date.now()) {
+    this.db.prepare('DELETE FROM quarantines WHERE expires_at <= ?').run(nowMs);
+    const rows = this.db
+      .prepare('SELECT * FROM quarantines WHERE expires_at > ? ORDER BY created_at DESC')
+      .all(nowMs);
+    return rows.map((r) => ({
+      ipKey: r.ip_key,
+      ip: r.ip,
+      reason: r.reason,
+      expiresAt: r.expires_at,
+      createdAt: r.created_at,
+      hits: r.hits
+    }));
+  }
+
   setThreatQuarantine(target, quarantined) {
     const flag = quarantined ? 1 : 0;
     const status = quarantined ? 'QUARANTINED' : 'TRACKING';
     const info = this.db
       .prepare('UPDATE threats SET quarantined = ?, status = ? WHERE actor_key = ? OR ip = ?')
       .run(flag, status, target, target);
+    if (!quarantined) {
+      this._stmtDeleteQuarantine.run(target, target);
+    }
     return info.changes;
   }
 
   insertDialogue(item) {
-    this._stmtInsertDialogue.run(
-      item.id,
-      item.timestamp,
-      item.from,
-      item.to,
-      item.severity,
-      item.modelUsed,
-      item.message,
-      JSON.stringify(item.metadata || {})
-    );
+    this.flushBatch({ dialogues: [item] });
   }
 
   loadDialogues(limit = 120) {
@@ -287,6 +394,22 @@ export class SQLiteStore {
     }));
   }
 
+  /**
+   * M-01: Retención de disco para evitar crecimiento sin límite.
+   */
+  pruneOldLogs({ maxRows = 50_000, maxAgeDays = 7 } = {}) {
+    const cutoffIso = new Date(Date.now() - maxAgeDays * 86_400_000).toISOString();
+    this.db.prepare('DELETE FROM dialogue_logs WHERE timestamp < ?').run(cutoffIso);
+    this.db
+      .prepare(
+        `DELETE FROM dialogue_logs WHERE id NOT IN (
+          SELECT id FROM dialogue_logs ORDER BY timestamp DESC LIMIT ?
+        )`
+      )
+      .run(maxRows);
+    this.db.prepare('DELETE FROM quarantines WHERE expires_at <= ?').run(Date.now());
+  }
+
   saveSetting(key, value) {
     this._stmtSaveSetting.run(key, JSON.stringify(value));
   }
@@ -302,7 +425,9 @@ export class SQLiteStore {
   }
 
   clearSessionData() {
-    this.db.exec('DELETE FROM threats; DELETE FROM dialogue_logs; DELETE FROM executive_reports;');
+    this.db.exec(
+      'DELETE FROM threats; DELETE FROM quarantines; DELETE FROM dialogue_logs; DELETE FROM executive_reports;'
+    );
   }
 
   close() {

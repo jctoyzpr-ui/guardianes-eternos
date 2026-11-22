@@ -25,10 +25,10 @@ export const PROVIDER_CATALOG = {
       'meta-llama/llama-3.3-70b-instruct:free',
       'google/gemini-2.5-pro',
       'google/gemini-2.5-flash',
-      'anthropic/claude-3.7-sonnet',
-      'anthropic/claude-3.5-haiku',
-      'openai/gpt-4o',
-      'openai/gpt-4o-mini',
+      'anthropic/claude-sonnet-4-5',
+      'anthropic/claude-haiku-4-5',
+      'openai/gpt-4.1',
+      'openai/gpt-4.1-mini',
       'qwen/qwen-2.5-coder-32b-instruct'
     ],
     costPerCallEstimateUsd: 0.0005
@@ -44,14 +44,14 @@ export const PROVIDER_CATALOG = {
     label: 'OpenAI API',
     requiresApiKey: true,
     supportsCustomModel: false,
-    models: ['gpt-4o-mini', 'gpt-4o'],
+    models: ['gpt-4.1-mini', 'gpt-4.1'],
     costPerCallEstimateUsd: 0.0015
   },
   anthropic: {
     label: 'Anthropic Claude API',
     requiresApiKey: true,
     supportsCustomModel: false,
-    models: ['claude-3-5-haiku', 'claude-3-7-sonnet'],
+    models: ['claude-haiku-4-5', 'claude-sonnet-4-5'],
     costPerCallEstimateUsd: 0.0022
   },
   deepseek: {
