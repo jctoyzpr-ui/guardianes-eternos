@@ -291,6 +291,16 @@ export class HermesCommander {
       return { blockedInjection: true, actions: [] };
     }
 
+    // H-08: Detectar frases negativas ("No pongas en cuarentena la IP 8.8.8.8", "No bloquees", "Nunca liberes")
+    // para jamás proponer la acción opuesta cuando el operador niega una orden.
+    const isNegatedDirective =
+      /\b(?:no|nunca|jam[aá]s|evita|evitar|tampoco|ni\s+se\s+te\s+ocurra)\s+(?:la\s+|lo\s+|les\s+)?(?:pongas|poner|ponga|bloquees|bloquear|bloquea|a[ií]sles|aislar|a[ií]sla|cuarentenes|liberes|liberar|libera|desbloquees|desbloquear|desbloquea|crees|crear|agregues|a[ñn]adas|desactives|desactivar|apagues|cambies|asignes)\b/i.test(
+        msg
+      );
+    if (isNegatedDirective) {
+      return { blockedInjection: false, negatedDirective: true, actions: [] };
+    }
+
     // 1. Navegación UI por chat (solo lectura)
     if (/\b(?:ll[eé]vame|abre|ir\s+a|mu[eé]strame\s+la\s+pantalla)\b/i.test(msg)) {
       if (/\bfirewall|escudo|waf|deploy\b/i.test(msg)) {
@@ -799,6 +809,24 @@ export class HermesCommander {
         assistantReply:
           '🛡️ **Bloqueo del Intent Firewall:** Detecté marcadores de inyección de instrucciones en el mensaje. Por seguridad, no ejecuté ningún cambio ni modifiqué las defensas.',
         modelUsed: 'intent-firewall-v5',
+        uiAction: null
+      };
+      this.chatHistory.push(turn);
+      if (this.chatHistory.length > MAX_CHAT_HISTORY) this.chatHistory.shift();
+      this._persistState();
+      return turn;
+    }
+
+    if (detection.negatedDirective) {
+      const turn = {
+        id: `hrm_${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        userMessage: operatorMessage,
+        executedTools: [],
+        pendingAction: null,
+        assistantReply:
+          '🛡️ **Instrucción negativa respetada:** Entendido, NO propuse ni ejecuté ningún cambio sobre cuarentenas, reglas ni configuración.',
+        modelUsed: 'hermes-tactical-nlu:v5.1',
         uiAction: null
       };
       this.chatHistory.push(turn);

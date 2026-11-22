@@ -218,7 +218,8 @@ export function buildSensorScript(shieldEndpointBase = '', { sensorNonce = '', i
  */
 export function buildDeployKit({
   guardianBaseUrl = 'https://shield.365collaboration.net',
-  protectedTargetUrl = 'https://www.365collaboration.net'
+  protectedTargetUrl = 'https://www.365collaboration.net',
+  sidecarSecretPlaceholder = 'REEMPLAZAR_CON_GUARDIANES_SIDECAR_SECRET'
 } = {}) {
   const base = guardianBaseUrl.replace(/\/+$/, '');
   const target = protectedTargetUrl.replace(/\/+$/, '');
@@ -226,13 +227,15 @@ export function buildDeployKit({
   return {
     protectedTargetUrl: target,
     guardianBaseUrl: base,
-    nginxAuthRequestSnippet: `# Recomendado para producción: Nginx / Caddy Sidecar con auth_request (cero latencia en estáticos)
+    nginxAuthRequestSnippet: `# Recomendado para producción: Nginx Sidecar con auth_request (complemento junto a Cloudflare / OWASP CRS)
+# IMPORTANTE: auth_request inspecciona URI, query y cabeceras (NO cuerpos POST). Para cuerpos POST, usar WAF de borde o modo Reverse Proxy.
 # Colocar dentro de server { ... } para ${target}
 location = /guardianes/check {
     internal;
     proxy_pass http://127.0.0.1:4040/guardianes/check;
     proxy_pass_request_body off;
     proxy_set_header Content-Length "";
+    proxy_set_header X-Guardianes-Sidecar-Secret "${sidecarSecretPlaceholder}";
     proxy_set_header X-Original-URI $request_uri;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header User-Agent $http_user_agent;

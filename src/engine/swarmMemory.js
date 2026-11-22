@@ -215,15 +215,18 @@ export class SwarmMemory extends EventEmitter {
 
   /**
    * Registra cuarentena persistente independiente del límite LRU de 250 amenazas.
+   * N-03: Por defecto NO renueva ni extiende `expiresAt` si la IP ya tiene una cuarentena vigente.
    */
-  addQuarantine(ip, reason = 'High-risk threat', ttlMs = this.quarantineTtlMs) {
+  addQuarantine(ip, reason = 'High-risk threat', ttlMs = this.quarantineTtlMs, { renewExisting = false } = {}) {
     const ipKey = normalizeIpKey(ip);
     const existing = this.quarantineMap.get(ipKey);
+    const nowMs = Date.now();
+    const stillActive = Boolean(existing && existing.expiresAt > nowMs);
     const entry = {
       ipKey,
       ip: String(ip || 'unknown').replace(/^::ffff:/, ''),
-      reason,
-      expiresAt: Date.now() + ttlMs,
+      reason: stillActive && !renewExisting ? existing.reason : reason,
+      expiresAt: stillActive && !renewExisting ? existing.expiresAt : nowMs + ttlMs,
       createdAt: existing?.createdAt || new Date().toISOString(),
       hits: (existing?.hits || 0) + 1
     };
@@ -369,7 +372,7 @@ export class SwarmMemory extends EventEmitter {
 
     if (quarantined) {
       const cleanIp = target.replace(/^ip:/, '');
-      this.addQuarantine(cleanIp, 'Manual-Operator-Quarantine');
+      this.addQuarantine(cleanIp, 'Manual-Operator-Quarantine', this.quarantineTtlMs, { renewExisting: true });
       updated += 1;
     } else {
       if (this.quarantineMap.delete(ipKey) || this.quarantineMap.delete(target)) {

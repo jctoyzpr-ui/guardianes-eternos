@@ -1,7 +1,7 @@
 {
   "name": "guardianes-eternos",
-  "version": "5.0.0",
-  "description": "Eternal Guardians v5.0 — Dual-Plane Cyber Deception, WAF DPI, Adaptive Tarpit & Three.js Holographic 3D SOC (MIT Open Source)",
+  "version": "5.1.0",
+  "description": "Eternal Guardians v5.1 — Active Cyber Deception, Canary Tripwires, Adaptive Tarpit, Structural Detector & Three.js 3D SOC (MIT Open Source)",
   "main": "src/server.js",
   "type": "module",
   "license": "MIT",

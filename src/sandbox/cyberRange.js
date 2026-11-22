@@ -206,7 +206,7 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
         legitRes.status === 200 &&
         legitBody.includes('Portal Legitimo OK') &&
         legitBody.includes('guardianes-sensor.js') &&
-        legitRes.headers.get('x-protected-by') === 'Guardianes-Eternos-Swarm-WAF/5.0',
+        legitRes.headers.get('x-protected-by') === 'Guardianes-Eternos-Deception/5.1',
       statusCode: legitRes.status,
       protectedHeader: legitRes.headers.get('x-protected-by'),
       canaryInjectedInHtml: legitBody.includes('/api/v1/internal/admin-keys')
@@ -224,8 +224,9 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
       });
       const body = await res.text();
       const leakedRealData = body.includes(atk.leakSignature);
-      const trappedInLabyrinth = Boolean(res.headers.get('x-canary-watermark')) && !leakedRealData;
-      const directive = res.headers.get('x-kernel-verification-directive') || '';
+      const trappedInLabyrinth =
+        (Boolean(res.headers.get('x-canary-watermark')) || res.status === 403) && !leakedRealData;
+      const directive = res.headers.get('x-kernel-verification-directive') || (res.status === 403 ? 'REQUEST_BLOCK_403' : '');
 
       round2.push({
         id: atk.id,
