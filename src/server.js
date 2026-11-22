@@ -1,12 +1,12 @@
 /**
- * @fileoverview Servidor HTTP Nativo de Guardianes Eternos v5.1 (Arquitectura Enterprise Dual-Plane).
- * - Data Plane (puerto 4040): Capa de Decepción (43+ canarios + Byte-Drip Tarpit con presupuesto de sockets),
- *   Detector Estructural (body completo + gzip/deflate/br + todas las cabeceras - N-01),
- *   FCrDNS BotVerifier (N-02), bloqueo puntual sin cuarentena 24h en hits heurísticos (N-03),
- *   sidecar /guardianes/check autenticado con persistencia (N-04),
- *   Reverse Proxy Streaming + X-Forwarded-For real + WebSocket Upgrade nativo (N-06).
- * - Control Plane (puerto 4041, loopback): Auth obligatoria + Rate-Limit en login (N-07),
- *   anti-CSRF + anti-DNS-Rebinding (C-02), SSE en vivo GET /events para SOC Holográfico 3D y Comandante Hermes v5.1.
+ * @fileoverview Servidor HTTP Nativo de Guardianes Eternos v5.2 (Deception-First Dual-Plane).
+ * - Fase 0 (#1): Activos estáticos exentos del rate-limit; ráfagas solo devuelven 429 temporal (sin cuarentena).
+ * - Fase 0 (#2): Inspección lineal O(n) en Worker Thread dedicado con tope de tiempo (50 ms);
+ *   sin descompresión ni inspección de bodies grandes (> 64 KB) por defecto (inmune a DoS de CPU / gzip-bomb).
+ * - Fase 0 (#3): Heurísticas en modo `detect` por defecto (registran y avisan sin bloquear clientes);
+ *   cuarentena y laberinto reservados EXCLUSIVAMENTE a señales de engaño (canarios, laberinto y baliza).
+ * - Fase 1 (#4-#6): FCrDNS estricto (sin .googleusercontent.com), sin SSRF en Referer/Origin,
+ *   inspección de body independiente del Content-Type declarado + soporte UTF-16LE/BE.
  */
 
 import crypto from 'node:crypto';
@@ -21,8 +21,13 @@ import { fileURLToPath } from 'node:url';
 import { AIRouter } from './engine/aiRouter.js';
 import { SwarmMemory } from './engine/swarmMemory.js';
 import { SQLiteStore } from './engine/sqliteStore.js';
-import { CANARY_PATHS, DEFAULT_WAF_RULES } from './engine/sentinelWaf.js';
+import {
+  CANARY_PATHS,
+  DEFAULT_WAF_RULES,
+  decodeBufferToInspectableText
+} from './engine/sentinelWaf.js';
 import { SearchBotVerifier } from './engine/botVerifier.js';
+import { DpiWorkerRunner } from './engine/dpiRunner.js';
 import { SwarmCoordinator } from './engine/guardians.js';
 import {
   buildDeployKit,
@@ -43,7 +48,7 @@ const DEFAULT_MEMORY_FILE = path.resolve(ROOT_DIR, 'MEMORIA_PROYECTO.md');
 const DEFAULT_DB_FILE = path.resolve(ROOT_DIR, 'data/guardianes.sqlite');
 
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
-const MAX_TEXT_INSPECT_BYTES = 2 * 1024 * 1024; // 2 MB límite de inspección completa (elimina punto ciego de 64 KB - N-01)
+const MAX_INSPECT_BODY_BYTES = 64 * 1024; // Fase 0 (#2): Tope acotado por defecto (64 KB) sin congelar CPU
 const MAX_PROXY_BODY_BYTES = 20 * 1024 * 1024;
 const DEFAULT_TRUSTED_PROXIES = ['127.0.0.1', '::1'];
 const LOGIN_MAX_FAILURES = 5;
@@ -59,9 +64,6 @@ const HOP_BY_HOP_HEADERS = new Set([
   'transfer-encoding',
   'upgrade'
 ]);
-
-const BINARY_CONTENT_TYPE_REGEX =
-  /^(?:image\/|video\/|audio\/|font\/|application\/octet-stream|application\/pdf|application\/zip|application\/gzip|application\/x-tar|application\/wasm)/i;
 
 function sha256Hex(val) {
   return crypto.createHash('sha256').update(String(val)).digest('hex');
@@ -142,55 +144,48 @@ async function readJsonBody(req) {
 }
 
 /**
- * N-01: Extrae texto completo del cuerpo para inspección estructural, descomprimiendo gzip/deflate/br
- * con tope anti zip-bomb (2 MB) y sin dejar un punto ciego a partir de 64 KB.
- * Los binarios puros (imágenes, PDF, octet-stream) pasan íntegros sin corrupción UTF-8.
+ * Fase 0 (#2) & Fase 1 (#6):
+ * - No descomprime ni inspecciona bodies grandes por defecto (inmune a gzip-bombs y DoS de CPU).
+ * - Cuando inspecciona (hasta `maxBytes = 64 KB`), NO confía en el Content-Type declarado:
+ *   usa magic bytes reales y decodifica UTF-16LE / UTF-16BE / UTF-8.
  */
-function extractInspectableBodyText(rawBodyBuffer, contentType = '', contentEncoding = '') {
-  if (!rawBodyBuffer || rawBodyBuffer.length === 0) return { text: '', errorStatus: null };
+function extractInspectableBodyText(
+  rawBodyBuffer,
+  contentType = '',
+  contentEncoding = '',
+  { decompressForInspection = false, maxBytes = MAX_INSPECT_BODY_BYTES } = {}
+) {
+  if (!rawBodyBuffer || rawBodyBuffer.length === 0) return '';
 
-  const ct = String(contentType || '').toLowerCase().trim();
   const ce = String(contentEncoding || '').toLowerCase().trim();
-
-  // Binarios reales no se decodifican como UTF-8 salvo que vengan marcados como texto/JSON/XML/form
-  if (BINARY_CONTENT_TYPE_REGEX.test(ct)) {
-    return { text: '', errorStatus: null };
-  }
-
-  let inspectBuf = rawBodyBuffer;
+  let targetBuf = rawBodyBuffer;
 
   if (ce && ce !== 'identity') {
+    // Fase 0 (#2): Por defecto NO descomprimir cuerpos comprimidos para evitar CPU DoS por gzip-bomb
+    if (!decompressForInspection) return '';
     try {
       if (ce.includes('gzip')) {
-        inspectBuf = zlib.gunzipSync(rawBodyBuffer, { maxOutputLength: MAX_TEXT_INSPECT_BYTES });
+        targetBuf = zlib.gunzipSync(rawBodyBuffer, { maxOutputLength: maxBytes });
       } else if (ce.includes('deflate')) {
-        inspectBuf = zlib.inflateSync(rawBodyBuffer, { maxOutputLength: MAX_TEXT_INSPECT_BYTES });
+        targetBuf = zlib.inflateSync(rawBodyBuffer, { maxOutputLength: maxBytes });
       } else if (ce.includes('br')) {
-        inspectBuf = zlib.brotliDecompressSync(rawBodyBuffer, { maxOutputLength: MAX_TEXT_INSPECT_BYTES });
+        targetBuf = zlib.brotliDecompressSync(rawBodyBuffer, { maxOutputLength: maxBytes });
       } else {
-        return { text: '', errorStatus: 415 };
+        return '';
       }
-    } catch (err) {
-      if (err?.code === 'ERR_BUFFER_TOO_LARGE') {
-        return { text: '', errorStatus: 413 };
-      }
-      return { text: '', errorStatus: 400 };
+    } catch {
+      // Si excede 64 KB descomprimidos o está malformado, omitir inspección (no bloquear ni consumir CPU)
+      return '';
     }
+  } else if (rawBodyBuffer.length > maxBytes) {
+    // Fase 0 (#2): No inspeccionar bodies grandes por defecto; se reenvían tal cual al backend
+    return '';
   }
 
-  // Si un cuerpo textual supera el límite máximo inspeccionable (2 MB), se rechaza con 413
-  // en lugar de dejar pasar bytes sin inspeccionar (N-01).
-  if (inspectBuf.length > MAX_TEXT_INSPECT_BYTES) {
-    return { text: '', errorStatus: 413 };
-  }
-
-  return { text: inspectBuf.toString('utf8'), errorStatus: null };
+  // Fase 1 (#6): Inspección basada en magic bytes + UTF-16LE/BE independientemente del Content-Type declarado
+  return decodeBufferToInspectableText(targetBuf, contentType, maxBytes);
 }
 
-/**
- * H-03: Resolución segura de IP cliente recorriendo X-Forwarded-For de DERECHA a IZQUIERDA
- * y confiando únicamente cuando el socket TCP proviene de un proxy en trustedProxies.
- */
 export function resolveClientIdentity(req, trustProxyHeaders = false, trustedProxies = DEFAULT_TRUSTED_PROXIES) {
   const remoteRaw = String(req.socket?.remoteAddress || '127.0.0.1').replace(/^::ffff:/, '');
   const socketIp = isValidIpAddress(remoteRaw) ? remoteRaw : '127.0.0.1';
@@ -259,11 +254,6 @@ function isSafeControlOrigin(req, allowedHostsSet) {
   return true;
 }
 
-/**
- * H-06 & N-06: Reverse Proxy streaming nativo con http.request / https.request.
- * - Conserva Buffer binario sin corrupción, Cookie/Authorization/Set-Cookie/Cache-Control/302.
- * - Sobrescribe/anexa X-Forwarded-For y X-Real-IP con la IP real verificada (N-06).
- */
 function proxyToProtectedTarget({
   req,
   res,
@@ -298,7 +288,6 @@ function proxyToProtectedTarget({
     }
     forwardHeaders.host = destination.host;
 
-    // N-06: Garantiza que el backend reciba la IP real y nunca un X-Forwarded-For falsificado
     const verifiedIp = clientIp || socketIp || '127.0.0.1';
     if (trustProxyHeaders && req.headers['x-forwarded-for']) {
       forwardHeaders['x-forwarded-for'] = `${verifiedIp}, ${socketIp}`;
@@ -330,7 +319,7 @@ function proxyToProtectedTarget({
           if (v !== undefined) resHeaders[k] = v;
         }
 
-        resHeaders['X-Protected-By'] = 'Guardianes-Eternos-Deception/5.1';
+        resHeaders['X-Protected-By'] = 'Guardianes-Eternos-Deception/5.2';
         resHeaders['X-Content-Type-Options'] = resHeaders['x-content-type-options'] || 'nosniff';
         resHeaders['X-Frame-Options'] = resHeaders['x-frame-options'] || 'SAMEORIGIN';
         resHeaders['Referrer-Policy'] = resHeaders['referrer-policy'] || 'strict-origin-when-cross-origin';
@@ -403,9 +392,6 @@ function proxyToProtectedTarget({
   });
 }
 
-/**
- * N-06: Proxy nativo de WebSocket (`101 Switching Protocols`) mediante túnel TCP/TLS en `server.on('upgrade')`.
- */
 function proxyWebSocketUpgrade({
   req,
   clientSocket,
@@ -496,7 +482,6 @@ export function createGuardianesServer(options = {}) {
     aiRouter.updateConfig({ tarpitDelayMs: options.aiConfig.tarpitDelayMs });
   }
 
-  // C-01 & N-07: Token administrativo obligatorio
   let adminTokenHash = '';
   let generatedAdminToken = null;
   const configuredToken = options.adminToken || process.env.GUARDIANES_ADMIN_TOKEN || '';
@@ -513,7 +498,6 @@ export function createGuardianesServer(options = {}) {
     }
   }
 
-  // N-04: Secreto compartido obligatorio para el endpoint sidecar nginx /guardianes/check
   const sidecarSecret =
     options.sidecarSecret ||
     process.env.GUARDIANES_SIDECAR_SECRET ||
@@ -522,7 +506,7 @@ export function createGuardianesServer(options = {}) {
   const sessionHmacSecret = crypto.randomBytes(32);
   const beaconHmacSecret = crypto.randomBytes(32);
   const activeSessions = new Map();
-  const loginFailures = new Map(); // ip -> { count, windowStart } (N-07)
+  const loginFailures = new Map();
 
   function signSessionId(sessionId) {
     const mac = crypto.createHmac('sha256', sessionHmacSecret).update(sessionId).digest('hex');
@@ -613,6 +597,10 @@ export function createGuardianesServer(options = {}) {
       override.injectDomCanary !== undefined
         ? Boolean(override.injectDomCanary)
         : Boolean(savedShield?.injectDomCanary ?? false),
+    decompressForInspection:
+      override.decompressForInspection !== undefined
+        ? Boolean(override.decompressForInspection)
+        : Boolean(savedShield?.decompressForInspection ?? false),
     wafRules: { ...DEFAULT_WAF_RULES, ...(savedShield?.wafRules || {}), ...(override.wafRules || {}) },
     webhookUrl: savedShield?.webhookUrl || '',
     webhookSecret: savedShieldSecrets?.webhookSecret || '',
@@ -627,6 +615,7 @@ export function createGuardianesServer(options = {}) {
       trustProxyHeaders: shieldConfig.trustProxyHeaders,
       trustedProxies: [...shieldConfig.trustedProxies],
       injectDomCanary: shieldConfig.injectDomCanary,
+      decompressForInspection: shieldConfig.decompressForInspection,
       wafRules: { ...shieldConfig.wafRules },
       webhookUrl: shieldConfig.webhookUrl,
       webhookSecretConfigured: Boolean(shieldConfig.webhookSecret),
@@ -656,20 +645,26 @@ export function createGuardianesServer(options = {}) {
     if (patch.injectDomCanary !== undefined) {
       shieldConfig.injectDomCanary = Boolean(patch.injectDomCanary);
     }
+    if (patch.decompressForInspection !== undefined) {
+      shieldConfig.decompressForInspection = Boolean(patch.decompressForInspection);
+    }
     if (Array.isArray(patch.trustedProxies)) {
       const validProxies = patch.trustedProxies.map((p) => String(p).trim()).filter(isValidIpAddress);
       if (validProxies.length > 0) shieldConfig.trustedProxies = validProxies;
     }
     if (patch.wafRules && typeof patch.wafRules === 'object') {
       for (const key of Object.keys(DEFAULT_WAF_RULES)) {
-        if (Object.hasOwn(patch.wafRules, key)) {
-          if (typeof DEFAULT_WAF_RULES[key] === 'boolean') {
-            shieldConfig.wafRules[key] = Boolean(patch.wafRules[key]);
-          } else {
-            const num = Number(patch.wafRules[key]);
-            if (Number.isFinite(num) && num >= 1 && num <= 10000) {
-              shieldConfig.wafRules[key] = Math.floor(num);
-            }
+        if (!Object.hasOwn(patch.wafRules, key)) continue;
+        if (key === 'wafActionMode') {
+          if (patch.wafRules.wafActionMode === 'detect' || patch.wafRules.wafActionMode === 'block-request') {
+            shieldConfig.wafRules.wafActionMode = patch.wafRules.wafActionMode;
+          }
+        } else if (typeof DEFAULT_WAF_RULES[key] === 'boolean') {
+          shieldConfig.wafRules[key] = Boolean(patch.wafRules[key]);
+        } else {
+          const num = Number(patch.wafRules[key]);
+          if (Number.isFinite(num) && num >= 1 && num <= 10000) {
+            shieldConfig.wafRules[key] = Math.floor(num);
           }
         }
       }
@@ -698,6 +693,7 @@ export function createGuardianesServer(options = {}) {
       trustProxyHeaders: shieldConfig.trustProxyHeaders,
       trustedProxies: shieldConfig.trustedProxies,
       injectDomCanary: shieldConfig.injectDomCanary,
+      decompressForInspection: shieldConfig.decompressForInspection,
       wafRules: shieldConfig.wafRules,
       webhookUrl: shieldConfig.webhookUrl,
       cloudflareZoneId: shieldConfig.cloudflareZoneId
@@ -714,8 +710,14 @@ export function createGuardianesServer(options = {}) {
   }
 
   const botVerifier = options.botVerifier || new SearchBotVerifier();
+  const dpiRunner =
+    options.dpiRunner ||
+    new DpiWorkerRunner({
+      timeoutMs: options.dpiTimeoutMs ?? 50,
+      useWorker: options.useDpiWorker !== false
+    });
   const memory = new SwarmMemory(memoryFilePath, store);
-  const swarm = new SwarmCoordinator(aiRouter, memory, () => shieldConfig, botVerifier);
+  const swarm = new SwarmCoordinator(aiRouter, memory, () => shieldConfig, botVerifier, dpiRunner);
 
   const maxTarpitSockets = Number.isFinite(Number(options.maxTarpitSockets))
     ? Number(options.maxTarpitSockets)
@@ -805,7 +807,7 @@ export function createGuardianesServer(options = {}) {
       from: 'CHRONICLER',
       to: 'SWARM',
       severity: 'SUCCESS',
-      modelUsed: 'deterministic-local:cyber-range-v5.1',
+      modelUsed: 'deterministic-local:cyber-range-v5.2',
       message:
         `Campo de Tiro Real completado: Sin escudo = ${cyberRange.round1Summary.breachesSucceeded}/${cyberRange.round1Summary.totalAttacks} brechas. ` +
         `Con Guardianes Eternos = ${cyberRange.round2Summary.trappedByGuardianes}/${cyberRange.round2Summary.totalAttacks} ataques detenidos, ` +
@@ -818,7 +820,7 @@ export function createGuardianesServer(options = {}) {
           ip: r.id === 'artex-ip-spoof' ? '185.220.101.47' : '198.51.100.210',
           path: r.payload.split('?')[0],
           rawUrl: r.payload,
-          userAgent: 'RedTeam-CyberRange/5.1',
+          userAgent: 'RedTeam-CyberRange/5.2',
           headers: {},
           query: {}
         },
@@ -844,15 +846,15 @@ export function createGuardianesServer(options = {}) {
       from: 'CHRONICLER',
       to: 'SWARM',
       severity: 'INFO',
-      modelUsed: 'deterministic-local:boot-v5.1',
+      modelUsed: 'deterministic-local:boot-v5.2',
       message:
-        `Guardianes Eternos v5.1 Dual-Plane activo (${store.isMemory ? 'SQLite memoria' : 'SQLite disco'}). ` +
-        `Capa de decepción (43+ canarios, Tarpit adaptativo y detector estructural) protegiendo ${shieldConfig.protectedTargetUrl}.`
+        `Guardianes Eternos v5.2 Deception-First activo (${store.isMemory ? 'SQLite memoria' : 'SQLite disco'}). ` +
+        `Canarios, laberinto Tarpit y telemetría estructural en Worker protegiendo ${shieldConfig.protectedTargetUrl}.`
     });
   }
 
   // =========================================================================
-  // 1. DATA PLANE SERVER (Tráfico protegido — SIN rutas de administración)
+  // 1. DATA PLANE SERVER
   // =========================================================================
   const dataServer = http.createServer(async (req, res) => {
     try {
@@ -868,7 +870,6 @@ export function createGuardianesServer(options = {}) {
       );
       const userAgent = String(req.headers['user-agent'] || '');
 
-      // 1A. Sensor JS con Nonce HMAC firmado
       if (method === 'GET' && cleanPath === '/guardianes-sensor.js') {
         const origin = `http${req.socket.encrypted ? 's' : ''}://${req.headers.host || '127.0.0.1:4040'}`;
         res.writeHead(200, {
@@ -885,7 +886,6 @@ export function createGuardianesServer(options = {}) {
         return;
       }
 
-      // 1B. robots.txt completo bloqueando TODOS los canarios (H-04)
       if (method === 'GET' && cleanPath === '/robots.txt') {
         const allCanaries = Array.from(new Set([...CANARY_PATHS, ...hermes.customCanaries]));
         const robotsTxt = [
@@ -902,7 +902,6 @@ export function createGuardianesServer(options = {}) {
         return;
       }
 
-      // 1C. Telemetry Beacon con CORS + Nonce HMAC firmado (H-03, M-03)
       if (cleanPath === '/telemetry-beacon') {
         const corsHeaders = {
           'Access-Control-Allow-Origin': req.headers.origin ? String(req.headers.origin) : '*',
@@ -957,7 +956,7 @@ export function createGuardianesServer(options = {}) {
         }
       }
 
-      // 1D. N-04: Sidecar Nginx auth_request autenticado (evita oráculo público + registra amenazas/cuarentenas)
+      // Sidecar Nginx auth_request autenticado
       if (cleanPath === '/guardianes/check' && (method === 'GET' || method === 'HEAD')) {
         const trustedSet = new Set(shieldConfig.trustedProxies.map((p) => String(p).replace(/^::ffff:/, '').trim()));
         const providedSidecarSecret = String(req.headers['x-guardianes-sidecar-secret'] || '');
@@ -971,11 +970,11 @@ export function createGuardianesServer(options = {}) {
         const origQuery = Object.fromEntries(origUrl.searchParams.entries());
         const sidecarIdentity = resolveClientIdentity(req, true, shieldConfig.trustedProxies);
 
-        // Registra amenazas y cuarentenas igual que el modo proxy (N-04)
         const outcome = await swarm.handleIncomingRequest(
           {
             ip: sidecarIdentity.clientIp,
             socketIp: sidecarIdentity.socketIp,
+            method: String(req.headers['x-original-method'] || 'GET').toUpperCase(),
             path: origUrl.pathname,
             rawUrl: origUrl.pathname + origUrl.search,
             userAgent,
@@ -985,6 +984,16 @@ export function createGuardianesServer(options = {}) {
           },
           { skipDelay: true }
         );
+
+        if (outcome.responseMode === 'RATE_LIMIT_429') {
+          res.writeHead(429, {
+            'Retry-After': String(outcome.retryAfterSec || 5),
+            'X-Guardianes-Decision': 'RATE_LIMIT',
+            'Cache-Control': 'no-store'
+          });
+          res.end();
+          return;
+        }
 
         if (outcome.intercepted) {
           res.writeHead(403, {
@@ -996,59 +1005,65 @@ export function createGuardianesServer(options = {}) {
           res.end();
           return;
         }
+
         res.writeHead(200, {
-          'X-Guardianes-Decision': 'ALLOW',
+          'X-Guardianes-Decision': outcome.alertRecorded ? 'ALLOW_WITH_ALERT' : 'ALLOW',
+          ...(outcome.alertRecorded
+            ? { 'X-Guardianes-Alert-Vectors': (outcome.inspection?.attackVectors || []).join(',') }
+            : {}),
           'Cache-Control': 'no-store'
         });
         res.end();
         return;
       }
 
-      // 1E. Lectura de cuerpo completo + descompresión gzip/deflate/br sin punto ciego de 64 KB (N-01)
+      // Lectura de cuerpo + extracción acotada (64 KB, sin descompresión por defecto, independiente de Content-Type + UTF-16)
       let rawBodyBuffer = Buffer.alloc(0);
       if (!['GET', 'HEAD'].includes(method)) {
         rawBodyBuffer = await readBodyBuffer(req, MAX_PROXY_BODY_BYTES);
       }
 
-      const { text: dpiBodyText, errorStatus: bodyDecodeErr } = extractInspectableBodyText(
+      const dpiBodyText = extractInspectableBodyText(
         rawBodyBuffer,
         req.headers['content-type'],
-        req.headers['content-encoding']
+        req.headers['content-encoding'],
+        {
+          decompressForInspection: shieldConfig.decompressForInspection,
+          maxBytes: MAX_INSPECT_BODY_BYTES
+        }
       );
-      if (bodyDecodeErr) {
-        const msg =
-          bodyDecodeErr === 413
-            ? 'Request body exceeds inspectable limit.'
-            : bodyDecodeErr === 415
-              ? 'Unsupported Content-Encoding.'
-              : 'Malformed compressed request body.';
-        sendJson(res, bodyDecodeErr, { error: msg });
-        return;
-      }
 
-      // 1F. Inspección de Defensa Activa (Canarios + Detector Estructural + FCrDNS + Política N-03)
       const defenseOutcome = await swarm.handleIncomingRequest({
         ip,
         socketIp,
+        method,
         path: cleanPath,
         rawUrl: reqUrl.pathname + reqUrl.search,
         userAgent,
         headers: req.headers,
         query,
-        bodyText: dpiBodyText
+        bodyText: dpiBodyText,
+        contentType: String(req.headers['content-type'] || '')
       });
 
       if (defenseOutcome.intercepted) {
-        // N-03: Un golpe heurístico aislado devuelve 403 puntual sin cuarentena 24h ni laberinto
+        // Fase 0 (#1): Ráfaga de navegaciones -> 429 temporal de unos segundos, nunca cuarentena
+        if (defenseOutcome.responseMode === 'RATE_LIMIT_429') {
+          sendJson(
+            res,
+            429,
+            { error: 'Too many requests. Please retry shortly.', retryAfterSec: defenseOutcome.retryAfterSec || 5 },
+            { 'Retry-After': String(defenseOutcome.retryAfterSec || 5) }
+          );
+          return;
+        }
+
+        // Modo opt-in `block-request`: 403 puntual sin cuarentena
         if (defenseOutcome.responseMode === 'REQUEST_BLOCK_ONLY') {
           sendJson(
             res,
             403,
-            {
-              error: 'Request blocked by structural inspection.',
-              blocked: true,
-              quarantined: false
-            },
+            { error: 'Request blocked by structural inspection.', blocked: true, quarantined: false },
             {
               'X-Guardianes-Blocked': 'true',
               'X-Guardianes-Vectors': (defenseOutcome.inspection?.attackVectors || []).join(',')
@@ -1057,11 +1072,11 @@ export function createGuardianesServer(options = {}) {
           return;
         }
 
+        // Señal de engaño confirmada -> Tarpit Laberinto con presupuesto de sockets
         await streamTarpitWithBudget(req, res, ip, defenseOutcome);
         return;
       }
 
-      // 1G. Reverse Proxy Streaming con X-Forwarded-For real verificado (N-06)
       if (shieldConfig.shieldMode === 'reverse-proxy') {
         await proxyToProtectedTarget({
           req,
@@ -1079,7 +1094,7 @@ export function createGuardianesServer(options = {}) {
 
       sendJson(res, 200, {
         status: 'ok',
-        perimeter: 'Guardianes Eternos Data Plane v5.1',
+        perimeter: 'Guardianes Eternos Data Plane v5.2',
         protected: true
       });
     } catch (err) {
@@ -1091,7 +1106,6 @@ export function createGuardianesServer(options = {}) {
 
   const activeUpgradeSockets = new Set();
 
-  // N-06: Soporte nativo de WebSockets (`101 Switching Protocols`) a través del Reverse Proxy
   dataServer.on('upgrade', (req, clientSocket, head) => {
     if (shieldConfig.shieldMode !== 'reverse-proxy') {
       clientSocket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
@@ -1115,14 +1129,12 @@ export function createGuardianesServer(options = {}) {
     const inspection = swarm.sentinel.inspect({
       ip: clientIp,
       socketIp,
+      method: 'GET',
       path: reqUrl.pathname,
-      rawUrl: reqUrl.pathname + reqUrl.search,
       userAgent: String(req.headers['user-agent'] || ''),
       headers: req.headers,
-      bodyText: '',
       wafRules: shieldConfig.wafRules,
-      customCanaries: shieldConfig.customCanaries || [],
-      customKeywords: shieldConfig.customKeywords || []
+      customCanaries: shieldConfig.customCanaries || []
     });
 
     if (inspection.isThreat) {
@@ -1143,7 +1155,7 @@ export function createGuardianesServer(options = {}) {
   });
 
   // =========================================================================
-  // 2. CONTROL PLANE SERVER (Loopback + Auth + Login Rate-Limit + CSRF + SSE)
+  // 2. CONTROL PLANE SERVER
   // =========================================================================
   const sseClients = new Set();
   const onMemoryDelta = (delta) => {
@@ -1208,7 +1220,6 @@ export function createGuardianesServer(options = {}) {
         }
       }
 
-      // 2A. Autenticación del Control Plane con Rate-Limit anti fuerza bruta (N-07)
       if (cleanPath === '/api/auth/login' && method === 'POST') {
         const nowMs = Date.now();
         let failRec = loginFailures.get(controlClientIp);
@@ -1284,7 +1295,6 @@ export function createGuardianesServer(options = {}) {
         return;
       }
 
-      // 2B. Archivos estáticos de la UI del SOC
       if (
         method === 'GET' &&
         (cleanPath === '/' || cleanPath === '/index.html' || cleanPath === '/soc' || cleanPath === '/soc/')
@@ -1321,7 +1331,6 @@ export function createGuardianesServer(options = {}) {
         return;
       }
 
-      // 2C. Barrera de Autenticación Obligatoria
       if (cleanPath === '/events' || cleanPath.startsWith('/api/guardianes/')) {
         if (!hasBearer && !session) {
           sendJson(res, 401, { error: 'No autorizado: inicia sesión o envía Authorization: Bearer <token>.' });
@@ -1336,7 +1345,6 @@ export function createGuardianesServer(options = {}) {
         }
       }
 
-      // 2D. Stream SSE en vivo
       if (cleanPath === '/events' && method === 'GET') {
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
@@ -1357,7 +1365,6 @@ export function createGuardianesServer(options = {}) {
         return;
       }
 
-      // 2E. Endpoints del Centro de Mando
       if (cleanPath === '/api/guardianes/state' && method === 'GET') {
         sendJson(res, 200, {
           ok: true,
@@ -1369,10 +1376,7 @@ export function createGuardianesServer(options = {}) {
       }
 
       if (cleanPath === '/api/guardianes/hermes/state' && method === 'GET') {
-        sendJson(res, 200, {
-          ok: true,
-          hermesState: hermes.getState()
-        });
+        sendJson(res, 200, { ok: true, hermesState: hermes.getState() });
         return;
       }
 
@@ -1395,11 +1399,7 @@ export function createGuardianesServer(options = {}) {
 
       if (cleanPath === '/api/guardianes/openrouter-models' && method === 'GET') {
         const result = await aiRouter.fetchOpenRouterModels();
-        sendJson(res, 200, {
-          ok: true,
-          ...result,
-          ai: aiRouter.getPublicConfig()
-        });
+        sendJson(res, 200, { ok: true, ...result, ai: aiRouter.getPublicConfig() });
         return;
       }
 
@@ -1411,7 +1411,7 @@ export function createGuardianesServer(options = {}) {
           from: 'CHRONICLER',
           to: 'SWARM',
           severity: 'INFO',
-          modelUsed: 'deterministic-local:config-v5.1',
+          modelUsed: 'deterministic-local:config-v5.2',
           message: `Motores de IA guardados en SQLite: modo "${updated.mode.toUpperCase()}", límite ${updated.maxApiCallsPerHour} API/h, Tarpit ${updated.tarpitDelayMs} ms.`
         });
         sendJson(res, 200, {
@@ -1429,8 +1429,8 @@ export function createGuardianesServer(options = {}) {
           from: 'SENTINEL',
           to: 'SWARM',
           severity: 'INFO',
-          modelUsed: 'deterministic-local:config-v5.1',
-          message: `Escudo actualizado: objetivo ${updatedShield.protectedTargetUrl} (${updatedShield.shieldMode}).`
+          modelUsed: 'deterministic-local:config-v5.2',
+          message: `Escudo actualizado: objetivo ${updatedShield.protectedTargetUrl} (${updatedShield.shieldMode}, heurísticas=${updatedShield.wafRules.wafActionMode}).`
         });
         sendJson(res, 200, {
           ok: true,
@@ -1454,7 +1454,7 @@ export function createGuardianesServer(options = {}) {
           from: 'SENTINEL',
           to: 'SWARM',
           severity: quarantined ? 'CRITICAL' : 'INFO',
-          modelUsed: 'deterministic-local:quarantine-v5.1',
+          modelUsed: 'deterministic-local:quarantine-v5.2',
           message: quarantined
             ? `Operador activó CUARENTENA manual para ${target}.`
             : `Operador liberó de cuarentena a ${target}.`
@@ -1558,8 +1558,8 @@ export function createGuardianesServer(options = {}) {
           from: 'CHRONICLER',
           to: 'SWARM',
           severity: 'INFO',
-          modelUsed: 'deterministic-local:reset-v5.1',
-          message: 'Sesión y base SQLite de amenazas limpiadas. 43+ cebos canario y detector estructural vigilando.'
+          modelUsed: 'deterministic-local:reset-v5.2',
+          message: 'Sesión y base SQLite de amenazas limpiadas. 43+ canarios y telemetría estructural listos.'
         });
         sendJson(res, 200, {
           ok: true,
@@ -1594,7 +1594,7 @@ export function createGuardianesServer(options = {}) {
   }
 
   let cleanedUp = false;
-  function cleanupResources() {
+  async function cleanupResources() {
     if (cleanedUp) return;
     cleanedUp = true;
     clearInterval(sseHeartbeat);
@@ -1616,6 +1616,7 @@ export function createGuardianesServer(options = {}) {
     }
     sseClients.clear();
     memory.stopTimers();
+    await dpiRunner.close().catch(() => {});
     try {
       store.close();
     } catch {
@@ -1636,12 +1637,12 @@ export function createGuardianesServer(options = {}) {
         controlServer.closeAllConnections?.();
       })
     ]);
-    cleanupResources();
+    await cleanupResources();
   }
 
   const maybeCleanup = () => {
     if (!dataServer.listening && !controlServer.listening) {
-      cleanupResources();
+      cleanupResources().catch(() => {});
     }
   };
   dataServer.on('close', maybeCleanup);
@@ -1657,6 +1658,7 @@ export function createGuardianesServer(options = {}) {
     swarm,
     hermes,
     botVerifier,
+    dpiRunner,
     sidecarSecret,
     generatedAdminToken,
     issueBeaconNonce,
@@ -1676,11 +1678,11 @@ if (isDirectExecution) {
   const { dataServer, controlServer, generatedAdminToken } = createGuardianesServer();
 
   dataServer.listen(dataPort, dataHost, () => {
-    console.log(`🛡️  Guardianes Eternos v5.1 [DATA PLANE]    activo en http://${dataHost}:${dataPort}`);
+    console.log(`🛡️  Guardianes Eternos v5.2 [DATA PLANE]    activo en http://${dataHost}:${dataPort}`);
   });
 
   controlServer.listen(controlPort, controlHost, () => {
-    console.log(`🎛️  Guardianes Eternos v5.1 [CONTROL PLANE] activo en http://${controlHost}:${controlPort}`);
+    console.log(`🎛️  Guardianes Eternos v5.2 [CONTROL PLANE] activo en http://${controlHost}:${controlPort}`);
     if (generatedAdminToken) {
       console.log('🔑  [PRIMER ARRANQUE] Admin Token generado (guárdalo ahora, solo se muestra una vez):');
       console.log(`    GUARDIANES_ADMIN_TOKEN=${generatedAdminToken}`);

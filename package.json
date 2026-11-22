@@ -1,13 +1,14 @@
 {
   "name": "guardianes-eternos",
-  "version": "5.1.0",
-  "description": "Eternal Guardians v5.1 — Active Cyber Deception, Canary Tripwires, Adaptive Tarpit, Structural Detector & Three.js 3D SOC (MIT Open Source)",
+  "version": "5.2.0",
+  "description": "Eternal Guardians v5.2 — Deception-First Cyber Defense (Canaries, Adaptive Tarpit, Off-Thread Structural Telemetry & Three.js 3D SOC)",
   "main": "src/server.js",
   "type": "module",
   "license": "MIT",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/guardianes.test.js"
+    "test": "node --test test/guardianes.test.js",
+    "benchmark": "node test/benchmark.js"
   },
   "keywords": [
     "cybersecurity",

@@ -167,7 +167,8 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
       shieldMode: 'reverse-proxy',
       protectedTargetUrl: victimUrl,
       trustProxyHeaders: false,
-      injectDomCanary: true
+      injectDomCanary: true,
+      wafRules: { wafActionMode: 'block-request' }
     }
   });
   const shieldServer = instance.dataServer;
@@ -206,7 +207,7 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
         legitRes.status === 200 &&
         legitBody.includes('Portal Legitimo OK') &&
         legitBody.includes('guardianes-sensor.js') &&
-        legitRes.headers.get('x-protected-by') === 'Guardianes-Eternos-Deception/5.1',
+        legitRes.headers.get('x-protected-by') === 'Guardianes-Eternos-Deception/5.2',
       statusCode: legitRes.status,
       protectedHeader: legitRes.headers.get('x-protected-by'),
       canaryInjectedInHtml: legitBody.includes('/api/v1/internal/admin-keys')

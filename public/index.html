@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Guardianes Eternos v5.1 — Decepción Cibernética, Canarios, Tarpit &amp; SOC Holográfico 3D</title>
+  <title>Guardianes Eternos v5.2 — Decepción Cibernética, Canarios, Tarpit &amp; SOC Holográfico 3D</title>
   <style>
     :root {
       --bg-void: #050810;
@@ -606,7 +606,7 @@
         <div class="shield-logo">🛡️</div>
         <div>
           <div class="brand-title">GUARDIANES ETERNOS</div>
-          <div class="brand-ver">v5.1 DECEPTION 3D · MIT</div>
+          <div class="brand-ver">v5.2 DECEPTION 3D · MIT</div>
         </div>
       </div>
 
@@ -656,9 +656,9 @@
       <header class="topbar">
         <div class="topbar-left">
           <h2>
-            Centro de Mando de Decepción v5.1
+            Centro de Mando de Decepción v5.2
             <span class="pill emerald">● DUAL-PLANE ACTIVO</span>
-            <span class="pill cyan" id="badge-persistence">SQLite Batched + Canarios + Tarpit</span>
+            <span class="pill cyan" id="badge-persistence">Worker DPI + Canarios + Tarpit</span>
           </h2>
           <div class="topbar-meta">
             <span>Objetivo: <strong id="badge-target" style="color:var(--text-primary);">https://www.365collaboration.net</strong></span>
@@ -976,7 +976,14 @@
                 <option value="reverse-proxy">Reverse Proxy Streaming (Preserva Cookies, Binarios y 302)</option>
               </select>
             </div>
-            <label>Reglas de Inspección Profunda (DPI Multicapa)</label>
+            <div class="field">
+              <label>Acción para Reglas Heurísticas (Cuarentena reservada SOLO a Canarios / Laberinto / Baliza)</label>
+              <select id="waf-action-mode">
+                <option value="detect">Solo Detección y Alerta (Recomendado en tiendas — 0 bloqueos a clientes)</option>
+                <option value="block-request">Bloqueo Puntual 403 (Sin cuarentena 24h ni 3-strikes)</option>
+              </select>
+            </div>
+            <label>Reglas de Inspección Estructural (Worker Thread fuera del Event Loop)</label>
             <div class="checks-grid">
               <label class="check-item"><input type="checkbox" id="waf-sqli" checked /> SQL Injection</label>
               <label class="check-item"><input type="checkbox" id="waf-xss" checked /> XSS &amp; Entidades HTML</label>
@@ -988,8 +995,8 @@
               <label class="check-item"><input type="checkbox" id="shield-dom-canary" /> Inyectar Cebo DOM (Opt-in SEO Safe)</label>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-              <div class="field"><label>Máx. req / 10 seg</label><input type="number" id="waf-rate-max" value="25" /></div>
-              <div class="field"><label>Umbral Auto-Cuarentena</label><input type="number" id="waf-quarantine-score" value="85" /></div>
+              <div class="field"><label>Máx. navegaciones / 10 seg (estáticos excluidos -> solo 429)</label><input type="number" id="waf-rate-max" value="120" /></div>
+              <div class="field"><label>Umbral Riesgo Alerta</label><input type="number" id="waf-quarantine-score" value="85" /></div>
             </div>
             <div class="field"><label>Webhook SIEM / Slack / Discord (HMAC + Timestamp Anti-Replay)</label><input type="text" id="shield-webhook-url" placeholder="https://..." /></div>
             <div class="field"><label>Secreto Firma Webhook <span id="status-webhook-secret" class="small"></span></label><input type="password" id="shield-webhook-secret" /></div>
@@ -1399,6 +1406,7 @@
       if (shield) {
         document.getElementById('shield-target-url').value = shield.protectedTargetUrl || 'https://www.365collaboration.net';
         document.getElementById('shield-mode').value = shield.shieldMode || 'standalone';
+        document.getElementById('waf-action-mode').value = shield.wafRules?.wafActionMode || 'detect';
         document.getElementById('waf-sqli').checked = Boolean(shield.wafRules?.sqlInjection);
         document.getElementById('waf-xss').checked = Boolean(shield.wafRules?.xssSkimming);
         document.getElementById('waf-lfi').checked = Boolean(shield.wafRules?.pathTraversal);
@@ -1826,6 +1834,7 @@
         shieldMode: document.getElementById('shield-mode').value,
         injectDomCanary: document.getElementById('shield-dom-canary').checked,
         wafRules: {
+          wafActionMode: document.getElementById('waf-action-mode').value,
           sqlInjection: document.getElementById('waf-sqli').checked,
           xssSkimming: document.getElementById('waf-xss').checked,
           pathTraversal: document.getElementById('waf-lfi').checked,

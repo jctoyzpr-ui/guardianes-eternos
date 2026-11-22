@@ -1,11 +1,9 @@
 /**
- * @fileoverview Motor de Detección Estructural & Rutas Canario v5.1 (0 dependencias npm).
- * Complementa firewalls de borde (Cloudflare / OWASP CRS) con:
- *   - 43+ Rutas Canario no-ancladas (0% dependencia de firmas para trampas de decepción)
- *   - Inspección estructural por familia (SQL tokenizer, HTML/XSS parser, SSRF canonical + BlockList,
- *     RCE/Shell/Log4Shell/SpEL, LFI, SSTI/NoSQL/XXE/Prototype Pollution)
- *   - Inspección de TODAS las cabeceras HTTP (incl. Accept-Language, Cookie, User-Agent, Referer)
- *   - Rate Limiter Comportamental por ventana deslizante.
+ * @fileoverview Motor de Detección Estructural, Rutas Canario y Rate Limiter v5.2 (0 dependencias npm).
+ * - Exención de activos estáticos para tiendas reales (50–100 archivos por página - Fase 0 #1).
+ * - Exclusión de Referer/Origin en análisis SSRF (Fase 1 #5).
+ * - Decodificación de body independiente del Content-Type declarado + UTF-16 (Fase 1 #6).
+ * - Modo por defecto `wafActionMode: 'detect'` (heurísticas solo registran y avisan; cuarentena reservada a engaño).
  */
 
 import {
@@ -16,11 +14,12 @@ import {
   analyzeSsrfStructure,
   analyzeXssStructure,
   canonicalizeObfuscatedIp,
+  decodeBufferToInspectableText,
   extractStructuredInputs,
   normalizePayloadMultiLayer
 } from './structuralDetector.js';
 
-export { canonicalizeObfuscatedIp, normalizePayloadMultiLayer };
+export { canonicalizeObfuscatedIp, decodeBufferToInspectableText, normalizePayloadMultiLayer };
 
 export const CANARY_PATHS = [
   '/.env',
@@ -69,6 +68,9 @@ export const CANARY_PATHS = [
 ];
 
 export const DEFAULT_WAF_RULES = {
+  // Fase 0 (#3): Por defecto las reglas heurísticas operan en modo detección (registran y avisan sin bloquear clientes).
+  // El operador puede cambiar opcionalmente a 'block-request' (403 puntual, jamás cuarentena 24h).
+  wafActionMode: 'detect',
   sqlInjection: true,
   xssSkimming: true,
   pathTraversal: true,
@@ -76,7 +78,8 @@ export const DEFAULT_WAF_RULES = {
   rceJava4Shell: true,
   sstiNosqlXxeProto: true,
   behavioralRateLimit: true,
-  rateLimitMaxPer10s: 25,
+  // Fase 0 (#1): Límite sobre navegaciones/API (excluye estáticos), apto para CGNAT/oficinas; solo devuelve 429 temporal.
+  rateLimitMaxPer10s: 120,
   autoQuarantineThreshold: 85
 };
 
@@ -103,7 +106,9 @@ const RESERVED_CONTROL_PATHS = new Set([
   '/events'
 ]);
 
-// Solo se ignoran cabeceras puras de transporte HTTP; TODAS las demás (incl. Accept-Language, Cookie, UA, Referer) SE INSPECCIONAN (N-01)
+const STATIC_ASSET_EXT_REGEX =
+  /\.(?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|eot|otf|mp4|webm|ogg|mp3|wav|pdf)$/i;
+
 const TRANSPORT_ONLY_HEADERS = new Set([
   'host',
   'connection',
@@ -113,10 +118,27 @@ const TRANSPORT_ONLY_HEADERS = new Set([
   'upgrade'
 ]);
 
-const URL_PARAM_KEY_REGEX = /(?:url|uri|redirect|callback|target|next|dest|destination|image|img|src|href|link|endpoint|webhook|fetch|proxy|feed|avatar|site|return|continue)/i;
+// Fase 1 (#5): Referer y Origin jamás deben evaluarse como SSRF (una web abierta por IP privada los envía siempre)
+const SSRF_EXCLUDED_HEADERS = new Set(['referer', 'origin', 'host']);
+
+const URL_PARAM_KEY_REGEX =
+  /(?:url|uri|redirect|callback|target|next|dest|destination|image|img|src|href|link|endpoint|webhook|fetch|proxy|feed|avatar|site|return|continue|import|load|file)/i;
+
+/**
+ * Fase 0 (#1): Determina si una petición GET/HEAD corresponde a un archivo estático legítimo
+ * (imágenes, CSS, JS, fuentes) que NO debe contarse en el límite de ráfagas por página.
+ */
+export function isStaticAssetRequest(cleanPath = '/', method = 'GET', extraCanaries = []) {
+  const m = String(method || 'GET').toUpperCase();
+  if (m !== 'GET' && m !== 'HEAD') return false;
+  const pathOnly = String(cleanPath || '/').split('?')[0];
+  if (isCanaryOrSensitivePath(pathOnly, extraCanaries)) return false;
+  if (pathOnly.includes('..') || pathOnly.includes(';')) return false;
+  return STATIC_ASSET_EXT_REGEX.test(pathOnly);
+}
 
 export function hasSsrfTargetInText(text) {
-  return analyzeSsrfStructure(text, { isUrlParamValue: false });
+  return analyzeSsrfStructure(text, { isUrlParamValue: false, isFreeProse: false });
 }
 
 export function validateCustomCanaryPath(rawPath) {
@@ -138,10 +160,6 @@ export function validateCustomWafKeyword(rawKeyword) {
   return cleaned;
 }
 
-/**
- * Normaliza rutas (dobles barras, matrix params ';.css', barra final, URL-encoding)
- * y detecta los 43+ canarios, rutas personalizadas y familias sensibles en cualquier subruta.
- */
 export function isCanaryOrSensitivePath(rawPath = '/', extraCanaries = []) {
   const pathOnly = String(rawPath).split('?')[0];
   const { noNulls } = normalizePayloadMultiLayer(pathOnly);
@@ -179,17 +197,20 @@ export function isCanaryOrSensitivePath(rawPath = '/', extraCanaries = []) {
 }
 
 /**
- * Inspección Estructural Multicapa en URL, parámetros, cuerpo completo y TODAS las cabeceras HTTP.
+ * Inspección Estructural Lineal O(n) sobre ruta REST, parámetros, cuerpo (JSON/multipart/form/texto)
+ * y cabeceras HTTP.
  */
 export function inspectPayloadDPI({
   rawUrl = '/',
   headers = {},
   bodyText = '',
+  contentType = '',
   wafRules = DEFAULT_WAF_RULES,
   customKeywords = []
 }) {
   const rules = { ...DEFAULT_WAF_RULES, ...(wafRules || {}) };
-  const structured = extractStructuredInputs({ rawUrl, bodyText });
+  const effectiveCt = contentType || headers['content-type'] || headers['Content-Type'] || '';
+  const structured = extractStructuredInputs({ rawUrl, bodyText, contentType: effectiveCt });
 
   const headerPairs = [];
   if (headers && typeof headers === 'object') {
@@ -226,12 +247,14 @@ export function inspectPayloadDPI({
   const vectors = [];
   let maxScore = 0;
 
-  // 1. SQL Injection (Tokenizador léxico estructural)
+  // 1. SQL Injection (tokenizador léxico por parámetro, segmento REST, multipart y cookies)
   if (rules.sqlInjection) {
     const sqlCandidates = [
       ...paramValues,
       ...cookieValues,
-      ...headerPairs.filter((h) => !['user-agent', 'accept', 'accept-language', 'accept-encoding'].includes(h.name)).map((h) => h.value)
+      ...headerPairs
+        .filter((h) => !['user-agent', 'accept', 'accept-language', 'accept-encoding', 'referer', 'origin'].includes(h.name))
+        .map((h) => h.value)
     ];
     if (sqlCandidates.length === 0 && structured.rawQuery) sqlCandidates.push(structured.rawQuery);
     if (sqlCandidates.length === 0 && bodyText) sqlCandidates.push(bodyText);
@@ -242,58 +265,69 @@ export function inspectPayloadDPI({
     }
   }
 
-  // 2. XSS / HTML Injection (Parser estructural de etiquetas reales + esquemas URI en contexto)
+  // 2. XSS / HTML Injection (etiquetas cerradas y sin cerrar + contexto JS)
   if (rules.xssSkimming) {
     const xssHit =
       structured.params.some((p) =>
         analyzeXssStructure(p.value, { isDirectUriParam: URL_PARAM_KEY_REGEX.test(p.key) })
       ) ||
-      [structured.rawPath, ...headerValues].some((txt) => analyzeXssStructure(txt, { isDirectUriParam: false }));
+      [structured.rawPath, ...headerPairs.filter((h) => h.name !== 'referer' && h.name !== 'origin').map((h) => h.value)].some((txt) =>
+        analyzeXssStructure(txt, { isDirectUriParam: false })
+      );
     if (xssHit) {
       vectors.push('XSS_AND_SCRIPT_SKIMMING');
       maxScore = Math.max(maxScore, 90);
     }
   }
 
-  // 3. Path Traversal / LFI (1 solo ../ incluido, sin FP en prosa libre "/etc/hosts")
+  // 3. Path Traversal / LFI
   if (rules.pathTraversal) {
     const lfiHit =
       analyzeLfiStructure(structured.rawPath, { isFreeProseBody: false }) ||
       structured.params.some((p) =>
-        analyzeLfiStructure(p.value, { isFreeProseBody: p.source === 'body' || p.source === 'json' || p.source === 'form' })
+        analyzeLfiStructure(p.value, { isFreeProseBody: p.source === 'body' || p.source === 'json' || p.source === 'form' || p.source === 'multipart' })
       ) ||
-      headerValues.some((txt) => analyzeLfiStructure(txt, { isFreeProseBody: true }));
+      headerPairs
+        .filter((h) => h.name !== 'referer' && h.name !== 'origin')
+        .some((h) => analyzeLfiStructure(h.value, { isFreeProseBody: true }));
     if (lfiHit) {
       vectors.push('PATH_TRAVERSAL_LFI');
       maxScore = Math.max(maxScore, 92);
     }
   }
 
-  // 4. SSRF & Cloud Metadata (esquemas, //, http:\\, nip.io/sslip.io + net.BlockList)
+  // 4. SSRF & Cloud Metadata (Fase 1 #5: NUNCA en Referer ni Origin; Fase 0 #3: sin FP en prosa libre)
   if (rules.ssrfMetadata) {
-    const ssrfHit =
-      structured.params.some((p) =>
-        analyzeSsrfStructure(p.value, { isUrlParamValue: URL_PARAM_KEY_REGEX.test(p.key) })
-      ) ||
-      [structured.rawQuery, bodyText, ...headerValues].some((txt) =>
-        analyzeSsrfStructure(txt, { isUrlParamValue: false })
-      );
-    if (ssrfHit) {
+    const ssrfParamHit = structured.params.some((p) => {
+      const isUrlKey = URL_PARAM_KEY_REGEX.test(p.key);
+      const isFreeProse = !isUrlKey && (p.source === 'body' || p.source === 'json' || p.source === 'form' || p.source === 'multipart');
+      return analyzeSsrfStructure(p.value, { isUrlParamValue: isUrlKey, isFreeProse });
+    });
+    const ssrfHeaderHit = headerPairs
+      .filter((h) => !SSRF_EXCLUDED_HEADERS.has(h.name) && h.name !== 'user-agent')
+      .some((h) => analyzeSsrfStructure(h.value, { isUrlParamValue: URL_PARAM_KEY_REGEX.test(h.name), isFreeProse: false }));
+
+    if (ssrfParamHit || ssrfHeaderHit) {
       vectors.push('SSRF_AND_CLOUD_METADATA');
       maxScore = Math.max(maxScore, 96);
     }
   }
 
-  // 5. RCE / Command Injection / Log4Shell / SpEL (incluyendo Accept-Language y saltos de línea %0a)
+  // 5. RCE / Command Injection / Log4Shell / SpEL
   if (rules.rceJava4Shell) {
-    const rceTargets = [structured.rawPath, ...paramValues, ...headerValues, ...cookieValues];
+    const rceTargets = [
+      structured.rawPath,
+      ...paramValues,
+      ...headerPairs.filter((h) => h.name !== 'referer' && h.name !== 'origin').map((h) => h.value),
+      ...cookieValues
+    ];
     if (rceTargets.some((txt) => analyzeRceStructure(txt))) {
       vectors.push('RCE_AND_JAVA4SHELL_LOG4SHELL');
       maxScore = Math.max(maxScore, 99);
     }
   }
 
-  // 6. SSTI / NoSQL (\u0024) / XXE / Prototype Pollution (claves JSON + query + texto)
+  // 6. SSTI (con y sin {{ }}), NoSQL, XXE (sin FP en XHTML DOCTYPE) y Prototype Pollution
   if (rules.sstiNosqlXxeProto) {
     const extrasHit = analyzeExtrasStructure({
       rawTexts: allTexts,
@@ -307,7 +341,7 @@ export function inspectPayloadDPI({
     }
   }
 
-  // 7. Reglas dinámicas por instancia creadas por el operador mediante Comandante Hermes
+  // 7. Reglas personalizadas del operador
   const allCustomKeywords = Array.isArray(customKeywords) ? customKeywords.filter(Boolean) : [];
   if (allCustomKeywords.length > 0) {
     const lowerTargets = allTexts.map((t) => normalizePayloadMultiLayer(String(t)).htmlDecoded.toLowerCase());
@@ -329,13 +363,14 @@ export function inspectPayloadDPI({
 
 /**
  * Rate Limiter Comportamental por ventana deslizante (10 segundos).
+ * Fase 0 (#1): Solo cuenta navegaciones/API no estáticas y nunca dispara cuarentena de 24h.
  */
 export class BehavioralRateLimiter {
   constructor() {
     this.buckets = new Map();
   }
 
-  recordRequest(ip, { windowMs = 10_000, threshold = 25 } = {}) {
+  recordRequest(ip, { windowMs = 10_000, threshold = 120 } = {}) {
     const now = Date.now();
     const key = String(ip || '127.0.0.1');
     let timestamps = this.buckets.get(key) || [];

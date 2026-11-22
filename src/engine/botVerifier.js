@@ -1,7 +1,7 @@
 /**
- * @fileoverview Verificador FCrDNS (Forward-Confirmed Reverse DNS) para crawlers legítimos (N-02).
- * Nunca confía en un User-Agent "Googlebot" o "Bingbot" sin verificación DNS inversa + directa.
- * Política fail-closed: mientras la IP no esté verificada por DNS, se trata como visitante normal.
+ * @fileoverview Verificador FCrDNS (Forward-Confirmed Reverse DNS) para crawlers legítimos (N-02 / Fase 1).
+ * Nunca confía en User-Agent ni acepta dominios de VMs cloud (.googleusercontent.com eliminado).
+ * Política fail-closed: mientras la IP no esté verificada por PTR + A/AAAA oficial, se trata como visitante normal.
  */
 
 import dns from 'node:dns/promises';
@@ -11,7 +11,8 @@ const BOT_RULES = [
   {
     name: 'Googlebot',
     uaRegex: /\b(?:googlebot|adsbot-google|mediapartners-google|google-inspectiontool)\b/i,
-    allowedSuffixes: ['.googlebot.com', '.google.com', '.googleusercontent.com']
+    // SOLO dominios oficiales de crawlers de Google (NUNCA .googleusercontent.com de VMs GCP)
+    allowedSuffixes: ['.googlebot.com', '.google.com']
   },
   {
     name: 'Bingbot',
@@ -30,8 +31,8 @@ const BOT_RULES = [
   }
 ];
 
-const VERIFIED_TTL_MS = 60 * 60 * 1000;   // 1 hora
-const UNVERIFIED_TTL_MS = 15 * 60 * 1000; // 15 minutos
+const VERIFIED_TTL_MS = 60 * 60 * 1000;
+const UNVERIFIED_TTL_MS = 15 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 2000;
 
 export function matchClaimedSearchBot(userAgent = '') {
@@ -44,15 +45,10 @@ export function matchClaimedSearchBot(userAgent = '') {
 }
 
 export class SearchBotVerifier {
-  /**
-   * @param {object} [options]
-   * @param {object} [options.dnsResolver] Resolver inyectable `{ reverse(ip), lookup(host, opts) }` para tests offline
-   * @param {boolean} [options.enableLiveDns=true]
-   */
   constructor({ dnsResolver = null, enableLiveDns = true } = {}) {
     this.dnsResolver = dnsResolver || dns;
     this.enableLiveDns = enableLiveDns;
-    this.cache = new Map(); // `${rule.name}:${ip}` -> { verified: boolean, expiresAt: number }
+    this.cache = new Map();
     this.inFlight = new Set();
   }
 
@@ -66,10 +62,6 @@ export class SearchBotVerifier {
     if (oldest) this.cache.delete(oldest);
   }
 
-  /**
-   * Consulta síncrona (fail-closed) usada en la ruta caliente de inspección HTTP.
-   * Si la IP no está en caché verificada, dispara verificación FCrDNS en segundo plano y devuelve `false`.
-   */
   isVerifiedSearchBot(ip, userAgent = '') {
     const rule = matchClaimedSearchBot(userAgent);
     if (!rule) return false;
@@ -77,7 +69,6 @@ export class SearchBotVerifier {
     const cleanIp = this._normalizeIp(ip);
     if (!cleanIp || net.isIP(cleanIp) === 0) return false;
 
-    // Loopback / privadas jamás son crawlers públicos oficiales de Google/Bing
     if (
       cleanIp === '127.0.0.1' ||
       cleanIp === '::1' ||
@@ -100,9 +91,6 @@ export class SearchBotVerifier {
     return false;
   }
 
-  /**
-   * Ejecuta la verificación FCrDNS completa (PTR -> sufijo oficial -> A/AAAA coincide con IP).
-   */
   async verifyAsync(ip, userAgent = '') {
     const rule = matchClaimedSearchBot(userAgent);
     if (!rule) return false;
