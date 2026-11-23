@@ -207,7 +207,7 @@ export async function runLiveCyberRangeComparison(createGuardianesServerFn) {
         legitRes.status === 200 &&
         legitBody.includes('Portal Legitimo OK') &&
         legitBody.includes('guardianes-sensor.js') &&
-        legitRes.headers.get('x-protected-by') === 'Guardianes-Eternos-Deception/5.2',
+        legitRes.headers.get('x-protected-by') === 'Guardianes-Eternos-Deception/5.3',
       statusCode: legitRes.status,
       protectedHeader: legitRes.headers.get('x-protected-by'),
       canaryInjectedInHtml: legitBody.includes('/api/v1/internal/admin-keys')

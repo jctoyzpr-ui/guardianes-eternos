@@ -80,7 +80,12 @@ export const DEFAULT_WAF_RULES = {
   behavioralRateLimit: true,
   // Fase 0 (#1): Límite sobre navegaciones/API (excluye estáticos), apto para CGNAT/oficinas; solo devuelve 429 temporal.
   rateLimitMaxPer10s: 120,
-  autoQuarantineThreshold: 85
+  autoQuarantineThreshold: 85,
+  // v5.3: tope de TEXTO de cuerpo inspeccionable (KB). Los archivos binarios de multipart no cuentan.
+  maxInspectBodyKb: 1024,
+  // v5.3: qué hacer con lo no inspeccionable (demasiado grande, encoding/charset no soportado, timeout, sobrecarga):
+  //   'auto' = bloquear en block-request y alertar en detect; 'block'; 'allow-with-alert'
+  uninspectablePolicy: 'auto'
 };
 
 const SENSITIVE_FAMILY_PATTERNS = [
@@ -235,6 +240,15 @@ export function inspectPayloadDPI({
   }
 
   const paramValues = structured.params.map((p) => p.value).filter(Boolean);
+  // v5.3: los NOMBRES de parámetro también llegan al backend (ORMs que ordenan/filtran por clave, frameworks que
+  // reflejan claves): `?x' UNION SELECT 1-- -=1` antes pasaba porque solo se miraban valores.
+  const paramKeys = Array.from(
+    new Set(
+      [...structured.params.map((p) => p.key), ...structured.jsonKeys].filter(
+        (k) => k && k !== '_path_segment' && !k.endsWith('.filename') && k.length >= 3
+      )
+    )
+  );
   const allTexts = [
     structured.rawPath,
     structured.rawQuery,
@@ -249,11 +263,14 @@ export function inspectPayloadDPI({
 
   // 1. SQL Injection (tokenizador léxico por parámetro, segmento REST, multipart y cookies)
   if (rules.sqlInjection) {
+    // v5.3: User-Agent y Accept-Language también se inspeccionan (se registran en BD: analytics, logs, auditoría).
+    // Referer/Origin siguen excluidos (traen búsquedas de otros sitios con texto libre).
     const sqlCandidates = [
       ...paramValues,
+      ...paramKeys,
       ...cookieValues,
       ...headerPairs
-        .filter((h) => !['user-agent', 'accept', 'accept-language', 'accept-encoding', 'referer', 'origin'].includes(h.name))
+        .filter((h) => !['accept', 'accept-encoding', 'referer', 'origin', 'cookie'].includes(h.name))
         .map((h) => h.value)
     ];
     if (sqlCandidates.length === 0 && structured.rawQuery) sqlCandidates.push(structured.rawQuery);
@@ -271,9 +288,12 @@ export function inspectPayloadDPI({
       structured.params.some((p) =>
         analyzeXssStructure(p.value, { isDirectUriParam: URL_PARAM_KEY_REGEX.test(p.key) })
       ) ||
-      [structured.rawPath, ...headerPairs.filter((h) => h.name !== 'referer' && h.name !== 'origin').map((h) => h.value)].some((txt) =>
-        analyzeXssStructure(txt, { isDirectUriParam: false })
-      );
+      [
+        structured.rawPath,
+        ...paramKeys,
+        ...cookieValues,
+        ...headerPairs.filter((h) => h.name !== 'referer' && h.name !== 'origin').map((h) => h.value)
+      ].some((txt) => analyzeXssStructure(txt, { isDirectUriParam: false }));
     if (xssHit) {
       vectors.push('XSS_AND_SCRIPT_SKIMMING');
       maxScore = Math.max(maxScore, 90);

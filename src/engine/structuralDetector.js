@@ -1,5 +1,8 @@
 /**
- * @fileoverview Analizador Estructural Lineal O(n) v5.2 (0 dependencias npm).
+ * @fileoverview Analizador Estructural Lineal O(n) v5.3 (0 dependencias npm).
+ * v5.3: sin recorte silencioso de campos, JSON léxico (claves duplicadas), ventanas SQL, operandos compuestos,
+ * subconsultas/CASE, best-fit Unicode y overlong UTF-8, rotura de atributos, OGNL, deserialización, CRLF, LDAP,
+ * Spring class-binding, wrappers de stream y rutas de sistema. Todos los bucles revisados para costo lineal real.
  * Diseñado específicamente para:
  *   1. Costo estrictamente lineal O(n) sin regex con backtracking cuadrático (inmune a DoS de CPU).
  *   2. Generalización estructural real por familia:
@@ -14,9 +17,12 @@
 
 import net from 'node:net';
 
-const MAX_FIELD_SCAN_CHARS = 65_536;
-const MAX_JSON_DEPTH = 64;
-const MAX_JSON_NODES = 10_000;
+// v5.3: Sin recorte silencioso de campos. Todo lo que el backend recibe (hasta el tope de cuerpo inspeccionable,
+// 1 MB por defecto) se analiza completo. La seguridad ante DoS viene de algoritmos lineales reales + Worker con
+// tope de tiempo, no de "no mirar" el final del campo (eso era una evasión: relleno + ataque al final).
+export const MAX_FIELD_SCAN_CHARS = 2 * 1024 * 1024;
+const SQL_WINDOW_CHARS = 2_000;
+const SQL_WINDOW_OVERLAP = 400;
 
 const SSRF_BLOCKLIST = new net.BlockList();
 SSRF_BLOCKLIST.addSubnet('0.0.0.0', 8, 'ipv4');
@@ -239,8 +245,19 @@ export function normalizePayloadMultiLayer(input) {
   let decoded = input.length > MAX_FIELD_SCAN_CHARS ? input.slice(0, MAX_FIELD_SCAN_CHARS) : input;
   for (let i = 0; i < 3; i += 1) {
     if (!decoded.includes('%') && !decoded.includes('+')) break;
+    // v5.3: Codificaciones no estándar que IIS / Tomcat / parsers laxos sí decodifican:
+    //   %uXXXX (IIS), UTF-8 "overlong" (%c0%ae = '.', %c0%af = '/', %e0%80%ae, %c1%9c = '\')
+    if (decoded.includes('%')) {
+      decoded = decoded
+        .replace(/%u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/%c0%ae|%e0%80%ae|%c0%2e/gi, '.')
+        .replace(/%c0%af|%e0%80%af|%c0%2f/gi, '/')
+        .replace(/%c1%9c|%c1%1c|%c0%5c/gi, '\\');
+    }
     try {
-      const next = decodeURIComponent(decoded.replace(/\+/g, ' '));
+      // v5.3: '+' = espacio solo en la PRIMERA capa (form-encoding). En capas siguientes un '+' viene de %2B y es
+      // literal (operador de concatenación MSSQL: `'+(SELECT ...)+'`); antes se convertía en espacio.
+      const next = decodeURIComponent(i === 0 ? decoded.replace(/\+/g, ' ') : decoded);
       if (next === decoded) break;
       decoded = next;
     } catch {
@@ -252,9 +269,19 @@ export function normalizePayloadMultiLayer(input) {
     }
   }
 
+  // v5.3: "best-fit" de Windows/IIS/ASP y formas de ancho completo: el backend las convierte a ASCII
+  //   ∕ ⁄ ／ -> '/',  ∖ ＼ ﹨ -> '\',  ． ․ ﹒ -> '.',  ＜script＞ -> <script>  (U+FF01..U+FF5E -> ASCII)
+  if (/[․⁄∕∖﹒﹨！-～]/.test(decoded)) {
+    decoded = decoded
+      .replace(/[∕⁄]/g, '/')
+      .replace(/[∖﹨]/g, '\\')
+      .replace(/[․﹒]/g, '.')
+      .replace(/[！-～]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0));
+  }
   const noNulls = decoded.includes('\0') ? decoded.replace(/\0/g, '') : decoded;
   const htmlDecoded = decodeEntitiesAndEscapes(noNulls);
-  const compactControl = htmlDecoded.replace(/[\x00-\x09\x0b\x0c\x0e-\x1f\x7f]+/g, '');
+  // v5.3: los navegadores ignoran TAB/LF/CR dentro de esquemas URI ("java\nscript:") -> también se eliminan aquí
+  const compactControl = htmlDecoded.replace(/[\x00-\x1f\x7f]+/g, '');
   const sqlEmptyComments = stripSqlCommentsLinear(htmlDecoded, '');
   const sqlSpaceComments = stripSqlCommentsLinear(htmlDecoded, ' ');
 
@@ -273,24 +300,110 @@ function parseMultipartFields(bodyText, contentType = '') {
   const parts = bodyText.split(delim);
   const fields = [];
 
-  for (let i = 1; i < parts.length && fields.length < 120; i += 1) {
+  // v5.3: sin tope de 120 campos (el campo 121 quedaba sin inspeccionar). El costo sigue siendo lineal.
+  for (let i = 1; i < parts.length; i += 1) {
     const part = parts[i];
     if (!part || part.startsWith('--')) continue;
     const sepIdx = part.indexOf('\r\n\r\n') !== -1 ? part.indexOf('\r\n\r\n') : part.indexOf('\n\n');
     if (sepIdx === -1) continue;
     const headerBlock = part.slice(0, sepIdx);
     const rawVal = part.slice(sepIdx + (part[sepIdx] === '\r' ? 4 : 2)).replace(/\r?\n$/, '');
-    const nameMatch = headerBlock.match(/name="([^"]{1,80})"/i);
-    const fileMatch = headerBlock.match(/filename="([^"]{1,160})"/i);
+    const nameMatch = headerBlock.match(/\bname="([^"]{1,200})"/i);
+    const fileMatch = headerBlock.match(/filename="([^"]{1,400})"/i);
+    // RFC 5987 (filename*=UTF-8''..%2e%2e%2f..) — antes se ignoraba
+    const fileStarMatch = headerBlock.match(/filename\*\s*=\s*(?:[a-z0-9-]+'[a-z-]*')?([^;\r\n]{1,600})/i);
     const key = nameMatch ? nameMatch[1] : '';
     if (fileMatch) {
       fields.push({ key: `${key}.filename`, value: decodeEntitiesAndEscapes(fileMatch[1]), source: 'multipart' });
     }
+    if (fileStarMatch) {
+      fields.push({ key: `${key}.filename`, value: normalizePayloadMultiLayer(fileStarMatch[1].trim()).htmlDecoded, source: 'multipart' });
+    }
+    // El nombre del campo también llega al backend (form[__proto__][x], campo con SQL, etc.)
+    if (key) fields.push({ key: `${key}`, value: '', source: 'multipart-key' });
     if (rawVal) {
       fields.push({ key, value: normalizePayloadMultiLayer(rawVal).htmlDecoded, source: 'multipart' });
     }
   }
   return fields;
+}
+
+function unescapeJsonString(raw) {
+  if (!raw.includes('\\')) return raw;
+  try {
+    return JSON.parse(`"${raw}"`);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * v5.3: Escáner léxico JSON estrictamente lineal O(n).
+ * Devuelve cada string (clave o valor) con su ruta de claves, sin depender de JSON.parse.
+ * Si la estructura no es JSON válido devuelve ok=false (el caller lo inspecciona como texto plano).
+ */
+export function scanJsonLexical(text) {
+  const params = [];
+  const keys = [];
+  const keyPaths = [];
+  // Pila de contenedores: { type: '{' | '[', key: clave actual dentro del objeto }
+  const stack = [];
+  const len = text.length;
+  let i = 0;
+  let expectKey = false;
+
+  const currentPath = () => {
+    const path = [];
+    for (let s = Math.max(0, stack.length - 4); s < stack.length; s += 1) {
+      if (stack[s].type === '{' && stack[s].key !== null) path.push(stack[s].key);
+    }
+    return path;
+  };
+
+  while (i < len) {
+    const ch = text[i];
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < len && text[j] !== '"') {
+        j += text[j] === '\\' ? 2 : 1;
+      }
+      if (j >= len) return { ok: false, params, keys, keyPaths };
+      const value = unescapeJsonString(text.slice(i + 1, j));
+      i = j + 1;
+      // ¿Es clave? (siguiente carácter no-espacio es ':')
+      let k = i;
+      while (k < len && (text[k] === ' ' || text[k] === '\n' || text[k] === '\r' || text[k] === '\t')) k += 1;
+      const top = stack[stack.length - 1];
+      if (text[k] === ':' && top?.type === '{' && expectKey) {
+        top.key = value;
+        keys.push(value);
+        keyPaths.push(currentPath());
+        expectKey = false;
+        i = k + 1;
+      } else {
+        const path = currentPath();
+        params.push({ key: path[path.length - 1] || '', value: decodeEntitiesAndEscapes(value), source: 'json' });
+      }
+      continue;
+    }
+    if (ch === '{') {
+      stack.push({ type: '{', key: null });
+      expectKey = true;
+    } else if (ch === '[') {
+      stack.push({ type: '[', key: null });
+      expectKey = false;
+    } else if (ch === '}' || ch === ']') {
+      const top = stack.pop();
+      if (!top || (ch === '}' && top.type !== '{') || (ch === ']' && top.type !== '[')) {
+        return { ok: false, params, keys, keyPaths };
+      }
+      expectKey = false;
+    } else if (ch === ',') {
+      expectKey = stack[stack.length - 1]?.type === '{';
+    }
+    i += 1;
+  }
+  return { ok: stack.length === 0, params, keys, keyPaths };
 }
 
 /**
@@ -342,38 +455,16 @@ export function extractStructuredInputs({ rawUrl = '/', bodyText = '', contentTy
       const mpFields = parseMultipartFields(bodyText, contentType);
       for (const f of mpFields) params.push(f);
     } else if (trimmedBody.startsWith('{') || trimmedBody.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(trimmedBody);
-        // Walker JSON iterativo (sin recursión, hasta 64 niveles y 10,000 nodos)
-        const stack = [{ node: parsed, keyStack: [], depth: 0 }];
-        let visited = 0;
-        while (stack.length > 0 && visited < MAX_JSON_NODES) {
-          const { node, keyStack, depth } = stack.pop();
-          visited += 1;
-          if (depth > MAX_JSON_DEPTH || node === null || node === undefined) continue;
-
-          if (typeof node === 'string') {
-            params.push({
-              key: keyStack[keyStack.length - 1] || '',
-              value: decodeEntitiesAndEscapes(node),
-              source: 'json'
-            });
-          } else if (Array.isArray(node)) {
-            for (let i = node.length - 1; i >= 0; i -= 1) {
-              stack.push({ node: node[i], keyStack, depth: depth + 1 });
-            }
-          } else if (typeof node === 'object') {
-            const keys = Object.getOwnPropertyNames(node);
-            for (let i = keys.length - 1; i >= 0; i -= 1) {
-              const k = keys[i];
-              const nextStack = keyStack.length < 4 ? [...keyStack, k] : [keyStack[keyStack.length - 1], k];
-              jsonKeys.push(k);
-              jsonKeyPaths.push(nextStack);
-              stack.push({ node: node[k], keyStack: nextStack, depth: depth + 1 });
-            }
-          }
-        }
-      } catch {
+      // v5.3: Escáner léxico lineal en vez de JSON.parse + walker:
+      //   - ve TODAS las claves y valores, incluidas claves duplicadas ({"u":"ok","u":"' OR 1=1--"}): JSON.parse se
+      //     queda con la última, pero muchos backends usan la primera -> antes era una evasión.
+      //   - sin tope de 10,000 nodos ni de 64 niveles (antes el nodo 10,001 quedaba sin inspeccionar).
+      const lex = scanJsonLexical(trimmedBody);
+      if (lex.ok) {
+        for (const p of lex.params) params.push(p);
+        for (const k of lex.keys) jsonKeys.push(k);
+        for (const kp of lex.keyPaths) jsonKeyPaths.push(kp);
+      } else {
         params.push({ key: '', value: normalizePayloadMultiLayer(trimmedBody).htmlDecoded, source: 'body' });
       }
     } else if (
@@ -422,6 +513,9 @@ function tokenizeSql(text, maxTokens = 400) {
   const s = String(text || '');
   let i = 0;
   const len = Math.min(s.length, MAX_FIELD_SCAN_CHARS);
+  // v5.3: si desde una comilla no existe cierre hasta el final, ninguna comilla posterior del mismo tipo lo tendrá
+  // (la alineación de escapes coincide) -> evita re-escaneos O(n²) con `'\'\'\'...`
+  const noCloseFrom = { "'": Infinity, '"': Infinity };
 
   while (i < len && tokens.length < maxTokens) {
     const ch = s[i];
@@ -486,14 +580,20 @@ function tokenizeSql(text, maxTokens = 400) {
         i += 1;
         continue;
       }
-      let j = i + 1;
-      while (j < len && s[j] !== quote) {
-        if (s[j] === '\\') j += 2;
-        else j += 1;
+      let j = len;
+      if (i < noCloseFrom[quote]) {
+        j = i + 1;
+        while (j < len && s[j] !== quote) {
+          if (s[j] === '\\') j += 2;
+          else j += 1;
+        }
+        if (j >= len) noCloseFrom[quote] = i;
       }
       if (j < len && s[j] === quote) {
         const inner = s.slice(i + 1, j);
-        if (/^\s*(?:or|and|union|select|order|group|having|;|\|\||&&)/i.test(inner)) {
+        // v5.3: también breakouts con operador de concatenación/aritmético antes de la subconsulta:
+        //   `'+(SELECT ...)+'` (MSSQL), `'||(SELECT ...)||'` (Oracle/PG), `'-(SELECT ...)-'`
+        if (/^\s*(?:[+\-*/%^&|]+\s*)?\(*\s*(?:or|and|union|select|order|group|having|exec|waitfor|case|;|\|\||&&)\b/i.test(inner) || /^\s*;/.test(inner)) {
           tokens.push({ type: 'QUOTE', val: quote });
           i += 1;
         } else {
@@ -508,6 +608,14 @@ function tokenizeSql(text, maxTokens = 400) {
     }
     if (ch >= '0' && ch <= '9') {
       let j = i;
+      // v5.3: literales hex/binarios SQL (0x31, 0b1) son un solo NUM (antes "0" + IDENT "x31" rompía la tautología)
+      if (ch === '0' && (s[i + 1] === 'x' || s[i + 1] === 'X' || s[i + 1] === 'b' || s[i + 1] === 'B')) {
+        j = i + 2;
+        while (j < len && /[0-9a-fA-F]/.test(s[j])) j += 1;
+        tokens.push({ type: 'NUM', val: s.slice(i, j) });
+        i = j;
+        continue;
+      }
       while (j < len && ((s[j] >= '0' && s[j] <= '9') || s[j] === '.')) j += 1;
       tokens.push({ type: 'NUM', val: s.slice(i, j) });
       i = j;
@@ -544,26 +652,199 @@ function tokenizeSql(text, maxTokens = 400) {
   return tokens;
 }
 
+const SQL_FUNCTION_KWS = new Set([
+  'CHAR', 'CHR', 'ASCII', 'ORD', 'SUBSTR', 'SUBSTRING', 'MID', 'HEX', 'UNHEX', 'CONCAT', 'CONCAT_WS', 'CAST',
+  'CONVERT', 'VERSION', 'USER', 'SCHEMA', 'DATABASE', 'SLEEP', 'PG_SLEEP', 'BENCHMARK', 'EXTRACTVALUE',
+  'UPDATEXML', 'GROUP_CONCAT', 'LOAD_FILE'
+]);
+
+/**
+ * v5.3: Salta un "operando" SQL completo a partir de toks[k]:
+ *   NUM | STR | IDENT | QUOTE | NULL/TRUE/FALSE | FUNC(...) | IDENT(...) | ( ... )
+ * Devuelve el índice siguiente al operando o -1 si no hay operando válido. Lineal (avanza siempre).
+ */
+function skipSqlOperand(toks, k) {
+  const n = toks.length;
+  if (k >= n) return -1;
+  const t = toks[k];
+  if ((t.type === 'KW' && SQL_FUNCTION_KWS.has(t.val)) || t.type === 'IDENT') {
+    if (toks[k + 1]?.type === 'LPAREN') {
+      let depth = 0;
+      for (let j = k + 1; j < n && j < k + 64; j += 1) {
+        if (toks[j].type === 'LPAREN') depth += 1;
+        else if (toks[j].type === 'RPAREN') {
+          depth -= 1;
+          if (depth === 0) return j + 1;
+        }
+      }
+      return -1;
+    }
+    return t.type === 'IDENT' ? k + 1 : -1;
+  }
+  if (t.type === 'LPAREN') {
+    let depth = 0;
+    for (let j = k; j < n && j < k + 64; j += 1) {
+      if (toks[j].type === 'LPAREN') depth += 1;
+      else if (toks[j].type === 'RPAREN') {
+        depth -= 1;
+        if (depth === 0) return j + 1;
+      }
+    }
+    return -1;
+  }
+  if (['NUM', 'STR', 'QUOTE'].includes(t.type)) return k + 1;
+  if (t.type === 'KW' && ['NULL', 'TRUE', 'FALSE'].includes(t.val)) return k + 1;
+  return -1;
+}
+
+function isSqlComparisonOp(op) {
+  return Boolean(op) && (op.type === 'CMP' || (op.type === 'KW' && ['LIKE', 'RLIKE', 'REGEXP', 'IN', 'BETWEEN', 'IS'].includes(op.val)));
+}
+
+/**
+ * v5.3: Ventanas solapadas de tamaño fijo -> cada parte de un campo largo se tokeniza (el ataque no puede
+ * esconderse en medio de 100 KB de relleno) y el costo total sigue siendo lineal.
+ */
+function sqlWindows(text) {
+  if (text.length <= SQL_WINDOW_CHARS) return [text];
+  const out = [];
+  const step = SQL_WINDOW_CHARS - SQL_WINDOW_OVERLAP;
+  for (let start = 0; start < text.length; start += step) {
+    out.push(text.slice(start, start + SQL_WINDOW_CHARS));
+    if (start + SQL_WINDOW_CHARS >= text.length) break;
+  }
+  return out;
+}
+
 export function analyzeSqlStructure(rawText) {
   if (!rawText || typeof rawText !== 'string' || rawText.length < 4) return false;
   const norm = normalizePayloadMultiLayer(rawText);
 
-  const slices = [];
-  for (const text of [norm.sqlEmptyComments, norm.sqlSpaceComments]) {
-    slices.push(text);
-    // Si un único campo es largo (> 1500 chars), también tokeniza la cola final completa en O(1)
-    if (text.length > 1500) {
-      slices.push(text.slice(-1500));
+  const variants = new Set([norm.sqlEmptyComments, norm.sqlSpaceComments]);
+  // v5.3: variante con '+' literal (valores JSON / cabeceras / %2B ya decodificado): el '+' es operador SQL
+  if (rawText.includes('+')) {
+    let plain = rawText.length > MAX_FIELD_SCAN_CHARS ? rawText.slice(0, MAX_FIELD_SCAN_CHARS) : rawText;
+    try {
+      plain = decodeURIComponent(plain);
+    } catch {
+      // se usa tal cual
     }
+    variants.add(stripSqlCommentsLinear(decodeEntitiesAndEscapes(plain.replace(/\0/g, '')), ' '));
+  }
+  const slices = [];
+  for (const text of variants) {
+    for (const w of sqlWindows(text)) slices.push(w);
   }
 
   for (const text of slices) {
-    const toks = tokenizeSql(text, 800);
+    const toks = tokenizeSql(text, 1200);
     const n = toks.length;
     if (n < 2) continue;
 
     for (let i = 0; i < n; i += 1) {
       const t = toks[i];
+
+      // v5.3 (0). Tautología/comparación con operandos compuestos tras pivote + booleano:
+      //   ' OR CHAR(49)=CHAR(49)--, 1 AND ASCII(x)>64, ' OR (SELECT 1)=1, ' OR 0x31=0x31
+      if (t.type === 'BOOL' && i > 0 && i + 1 < n) {
+        const prev = toks[i - 1];
+        if (['QUOTE', 'NUM', 'RPAREN', 'STR'].includes(prev.type)) {
+          const afterLhs = skipSqlOperand(toks, i + 1);
+          if (afterLhs !== -1 && isSqlComparisonOp(toks[afterLhs])) {
+            const afterRhs = skipSqlOperand(toks, afterLhs + 1);
+            const lhsIsCompound = toks[i + 1].type === 'LPAREN' || toks[i + 2]?.type === 'LPAREN';
+            const rhsTok = toks[afterLhs + 1];
+            const rhsIsCompound = rhsTok && (rhsTok.type === 'LPAREN' || toks[afterLhs + 2]?.type === 'LPAREN');
+            if (afterRhs !== -1 && (lhsIsCompound || rhsIsCompound)) return true;
+          }
+        }
+      }
+
+      // v5.3 (0b). Ruptura de comilla (QUOTE o QUOTE + ')') + booleano [NOT] + comparación entre paréntesis, o
+      //   cualquier expresión que TERMINA en comentario SQL: `x') OR NOT (2<1)-- `, `' AND (1)=(1)#`
+      if (t.type === 'BOOL' && i > 0) {
+        const p1 = toks[i - 1];
+        const p2 = toks[i - 2];
+        const quoteBreak = p1.type === 'QUOTE' || (p1.type === 'RPAREN' && p2?.type === 'QUOTE');
+        if (quoteBreak) {
+          let k = i + 1;
+          if (toks[k]?.type === 'KW' && toks[k].val === 'NOT') k += 1;
+          if (toks[k]?.type === 'LPAREN') {
+            const after = skipSqlOperand(toks, k);
+            const inner = toks.slice(k, after === -1 ? Math.min(n, k + 20) : after);
+            if (inner.some((x) => x.type === 'CMP' || (x.type === 'KW' && ['SELECT', 'TRUE', 'FALSE', 'NULL'].includes(x.val)))) return true;
+          }
+          for (let j = i + 1; j < n && j < i + 30; j += 1) {
+            if (toks[j].type === 'COMMENT') return true;
+            if (toks[j].type === 'QUOTE') break;
+          }
+        }
+      }
+
+      // v5.3 (0c). Comilla de ruptura seguida DIRECTAMENTE de una cláusula SQL: `admin' HAVING 1=1--`,
+      //   `x' GROUP BY 1--`, `x' ORDER BY 9--`, `x' LIMIT 1 INTO OUTFILE`, `x' PROCEDURE ANALYSE()`
+      if (t.type === 'QUOTE' && i + 1 < n) {
+        const nx = toks[i + 1];
+        const nx2 = toks[i + 2];
+        if (nx.type === 'KW' && nx2) {
+          if (nx.val === 'HAVING' && ['NUM', 'IDENT', 'LPAREN', 'STR', 'QUOTE'].includes(nx2.type)) return true;
+          if ((nx.val === 'GROUP' || nx.val === 'ORDER') && nx2.type === 'KW' && nx2.val === 'BY') return true;
+          if (nx.val === 'LIMIT' && nx2.type === 'NUM') return true;
+          if (nx.val === 'INTO' && nx2.type === 'KW' && nx2.val === 'OUTFILE') return true;
+          if (['UNION', 'SELECT', 'EXEC', 'EXECUTE', 'WAITFOR', 'DECLARE'].includes(nx.val)) return true;
+        }
+        if (nx.type === 'IDENT' && /^procedure$/i.test(nx.val) && nx2?.type === 'IDENT') return true;
+      }
+
+      // v5.3 (7). CASE WHEN <comparación> THEN — inyección en expresiones de orden/filtro (sort, order, column)
+      if (t.type === 'KW' && t.val === 'CASE' && toks[i + 1]?.type === 'KW' && toks[i + 1].val === 'WHEN') {
+        for (let j = i + 2; j < n && j < i + 40; j += 1) {
+          if (toks[j].type === 'KW' && toks[j].val === 'THEN') {
+            const inner = toks.slice(i + 2, j);
+            if (inner.some((x) => x.type === 'CMP' || x.type === 'LPAREN' || (x.type === 'KW' && SQL_FUNCTION_KWS.has(x.val)))) {
+              return true;
+            }
+            break;
+          }
+        }
+      }
+
+      // v5.3 (8). Subconsulta en posición de expresión: ,(SELECT ...) / =(SELECT ...) / OR (SELECT ...)
+      //   Exige contenido SQL real dentro (función, NUM, NULL, comparación, CASE, '*', @@var) para no confundir
+      //   prosa como "(select one from the list)".
+      if (t.type === 'LPAREN' && toks[i + 1]?.type === 'KW' && toks[i + 1].val === 'SELECT') {
+        const prev = i > 0 ? toks[i - 1] : null;
+        // posición de expresión: tras coma, comparación, booleano, comilla, paréntesis, palabra SQL u operador
+        // aritmético/concatenación (MSSQL `'+(SELECT ...)+'`, Oracle `'||(SELECT ...)||'`)
+        const exprPosition = prev && (
+          ['COMMA', 'CMP', 'BOOL', 'QUOTE', 'LPAREN', 'STR'].includes(prev.type) ||
+          (prev.type === 'OTHER' && ['+', '-', '*', '/', '%', '|', '&', '^'].includes(prev.val)) ||
+          (prev.type === 'KW' && ['IN', 'EXISTS', 'BY', 'WHERE', 'AND', 'SELECT', 'THEN', 'WHEN'].includes(prev.val))
+        );
+        if (exprPosition) {
+          let depth = 0;
+          let sqlSignal = false;
+          for (let j = i; j < n && j < i + 80; j += 1) {
+            const x = toks[j];
+            if (x.type === 'LPAREN') depth += 1;
+            else if (x.type === 'RPAREN') {
+              depth -= 1;
+              if (depth === 0) break;
+            }
+            if (
+              j > i + 1 &&
+              (x.type === 'NUM' ||
+                x.type === 'CMP' ||
+                (x.type === 'OTHER' && x.val === '*') ||
+                (x.type === 'IDENT' && x.val.startsWith('@@')) ||
+                (x.type === 'KW' && (SQL_FUNCTION_KWS.has(x.val) || ['NULL', 'CASE', 'INFORMATION_SCHEMA', 'LIMIT'].includes(x.val))))
+            ) {
+              sqlSignal = true;
+            }
+          }
+          if (sqlSignal) return true;
+        }
+      }
 
       // 1. Tautologías booleanas CON o SIN '=':
       //    - Comparaciones: ' OR 1=1, 1 OR 2>1, ' OR 'a' LIKE 'a, ' OR 1 IN (1), 1 OR 1 BETWEEN 0 AND 2
@@ -603,7 +884,11 @@ export function analyzeSqlStructure(rawText) {
               op.type === 'CMP' ||
               (op.type === 'KW' && ['LIKE', 'RLIKE', 'REGEXP', 'IN', 'BETWEEN', 'IS'].includes(op.val));
             if (isSqlCmp && rhs) {
+              // v5.3: con operador de PALABRA (LIKE/IN/IS/BETWEEN/REGEXP) entre dos palabras sueltas es prosa
+              // ("...'es la mejor' or something like that"), no SQL: se exige al menos un literal/paréntesis/NULL.
+              const wordOpBetweenIdents = op.type === 'KW' && lhs.type === 'IDENT' && rhs.type === 'IDENT';
               if (
+                !wordOpBetweenIdents &&
                 ['NUM', 'STR', 'IDENT', 'QUOTE'].includes(lhs.type) &&
                 (['NUM', 'STR', 'IDENT', 'QUOTE', 'LPAREN'].includes(rhs.type) ||
                   (rhs.type === 'KW' && ['NULL', 'NOT', 'TRUE', 'FALSE'].includes(rhs.val)))
@@ -722,7 +1007,9 @@ export function analyzeXssStructure(rawText, { isDirectUriParam = false } = {}) 
     const len = text.length;
 
     // 1. Scanner estrictamente lineal O(n) de etiquetas HTML (cerradas con '>' O sin cerrar hasta EOF!)
+    // v5.3: la posición del siguiente '>' se memoriza; antes cada '<' sin cierre re-escaneaba hasta el final (O(n²)).
     let pos = 0;
+    let gtCache = text.indexOf('>');
     while (pos < len) {
       const lt = text.indexOf('<', pos);
       if (lt === -1) break;
@@ -749,7 +1036,8 @@ export function analyzeXssStructure(rawText, { isDirectUriParam = false } = {}) 
       }
 
       const nextLt = text.indexOf('<', j);
-      const gt = text.indexOf('>', j);
+      if (gtCache !== -1 && gtCache < j) gtCache = text.indexOf('>', j);
+      const gt = gtCache;
       // Soporta etiquetas SIN CERRAR (`<svg/onload=alert(1)` hasta EOF o hasta el siguiente `<`)
       const end = gt !== -1 && (nextLt === -1 || gt < nextLt)
         ? gt
@@ -795,9 +1083,30 @@ export function analyzeXssStructure(rawText, { isDirectUriParam = false } = {}) 
       return true;
     }
 
-    // 4. AngularJS / Client-side Template sandbox escape
-    if (text.includes('{{') && /\{\{[^}]{0,120}\bconstructor\b[^}]{0,120}\}\}/i.test(text)) {
+    // v5.3 (3b). Rotura de atributo SIN etiqueta nueva: el valor se refleja dentro de value="..." y el atacante
+    //   cierra la comilla para añadir un manejador: `" autofocus onfocus=alert(1) x="`, `' onmouseover='alert(1)`
+    //   Exige comilla + espacio + (atributos opcionales) + on<evento>= + código JS, para no tocar prosa.
+    if (
+      /["'`][\s/]+(?:[a-z-]{1,24}(?:\s*=\s*(?:"[^"]{0,80}"|'[^']{0,80}'|[^\s>"']{0,80}))?[\s/]+){0,4}on[a-z]{3,24}\s*=\s*["'`]?\s*(?:[a-z_$][\w$.]{0,40}\s*[(`]|javascript:|eval|top\[|window\[|this\.|\[\]|\()/i.test(text) ||
+      /["'`][\s/]+style\s*=\s*["']?[^"'>]{0,120}(?:expression\s*\(|javascript:|behavior\s*:|-moz-binding)/i.test(text)
+    ) {
       return true;
+    }
+
+    // 4. AngularJS / Client-side Template sandbox escape
+    // v5.3: se ancla en cada "constructor" (raro) en vez de en cada "{{" (con 1 MB de "{{" la regex anterior
+    // retrocedía 120 caracteres por posición: ~1.4 s).
+    // (JavaScript distingue mayúsculas: el gadget solo funciona con "constructor" en minúsculas)
+    if (text.includes('{{')) {
+      let cPos = 0;
+      while ((cPos = text.indexOf('constructor', cPos)) !== -1) {
+        const before = text.slice(Math.max(0, cPos - 122), cPos);
+        const after = text.slice(cPos + 11, cPos + 133);
+        const open = before.lastIndexOf('{{');
+        const close = after.indexOf('}}');
+        if (open !== -1 && !before.slice(open).includes('}') && close !== -1 && !after.slice(0, close).includes('}')) return true;
+        cPos += 11;
+      }
     }
   }
 
@@ -885,6 +1194,18 @@ function isBlockedSsrfHost(rawAuthority) {
   const lower = host.toLowerCase().replace(/\.$/, '');
   if (!lower) return false;
 
+  // v5.3: camino rápido — hostname ASCII con TLD alfabético que no es interno ni de rebinding: nunca es una IP.
+  if (
+    /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,63}$/.test(lower) &&
+    !SSRF_BLOCKED_HOSTNAMES.has(lower) &&
+    !/\.(?:internal|local|localhost|localdomain|intranet|corp|home|lan)$/.test(lower) &&
+    !DNS_REBIND_SUFFIXES.some((sfx) => lower.endsWith(sfx)) &&
+    !/(?:^|\.)(?:localtest\.me|lvh\.me|vcap\.me|nip\.io|sslip\.io|xip\.io)$/.test(lower) &&
+    !lower.startsWith('metadata')
+  ) {
+    return false;
+  }
+
   if (
     SSRF_BLOCKED_HOSTNAMES.has(lower) ||
     lower.endsWith('.internal') ||
@@ -914,9 +1235,11 @@ function isBlockedSsrfHost(rawAuthority) {
   if (parsedIp && SSRF_BLOCKLIST.check(parsedIp.ip, parsedIp.family)) return true;
 
   try {
+    // El parser WHATWG normaliza lo que un backend Node/navegador también normalizará: IDNA (①②⑦ -> 127),
+    // IPv6 completas (0:0:0:0:0:ffff:7f00:1 -> ::ffff:7f00:1), mayúsculas, puntos finales.
     const u = new URL(`http://${authority}/`);
-    const uHost = u.hostname.toLowerCase();
-    if (SSRF_BLOCKED_HOSTNAMES.has(uHost)) return true;
+    const uHost = u.hostname.toLowerCase().replace(/\.$/, '');
+    if (SSRF_BLOCKED_HOSTNAMES.has(uHost) || uHost.endsWith('.internal') || uHost.endsWith('.localhost')) return true;
     const uIp = canonicalizeObfuscatedIp(uHost);
     if (uIp && SSRF_BLOCKLIST.check(uIp.ip, uIp.family)) return true;
   } catch {
@@ -940,11 +1263,19 @@ export function analyzeSsrfStructure(rawText, { isUrlParamValue = false, isFreeP
     return false;
   }
 
-  const schemeRegex = /(?:https?|gopher|dict|ftp|ldap|file):[\/\\]{1,3}([^\s"'<>/?#\\]+)/gi;
+  const schemeRegex = /(?:https?|gopher|dict|ftp|ldaps?|file|sftp|tftp|jar|netdoc|ws|wss):[\/\\]{1,3}([^\s"'<>/?#\\]+)/gi;
   let m;
+  // v5.3: TODAS las URLs del campo se revisan (un tope sería evasión: N URLs inocentes + la maliciosa).
+  // Hosts repetidos se resuelven una sola vez y los dominios ASCII normales salen por un camino rápido.
+  const seenHosts = new Set();
   while ((m = schemeRegex.exec(text)) !== null) {
-    if (isBlockedSsrfHost(m[1])) return true;
+    const authority = m[1];
+    if (seenHosts.has(authority)) continue;
+    seenHosts.add(authority);
+    if (isBlockedSsrfHost(authority)) return true;
   }
+  // v5.3: gopher:// y dict:// apuntando a cualquier host son herramientas de SSRF, no enlaces de usuario
+  if (isUrlParamValue && /^\s*(?:gopher|dict|tftp|jar|netdoc):/i.test(text)) return true;
 
   if (isUrlParamValue) {
     const trimmed = text.trim();
@@ -1076,10 +1407,12 @@ export function analyzeRceStructure(rawText) {
     const deob = deobfuscateShellLinear(base);
     for (const cand of [base, deob]) {
       // 2. Sustitución de comandos `$(...)` lineal
+      // v5.3: si no queda ningún ')' no se re-escanea por cada '$(' (antes 63 KB de "$(" = 117 ms -> fail-open)
       let p = 0;
       while ((p = cand.indexOf('$(', p)) !== -1) {
         const close = cand.indexOf(')', p + 2);
-        if (close !== -1 && close - p <= 180) {
+        if (close === -1) break;
+        if (close - p <= 180) {
           if (looksLikeShellInvocation(cand.slice(p + 2, close), '$(')) return true;
         }
         p += 2;
@@ -1094,20 +1427,29 @@ export function analyzeRceStructure(rawText) {
         p = close + 1;
       }
 
-      // 4. Encadenamiento con `;`, `||`, `&&`, `|`, `\n` escaneado linealmente
-      const sepRegex = /(?:&&|\|\||;|\||\r?\n)/g;
-      let m;
-      while ((m = sepRegex.exec(cand)) !== null) {
-        const delim = m[0].includes('\n') ? '\n' : m[0];
-        const nextSep = cand.slice(m.index + m[0].length, m.index + m[0].length + 160);
-        const cut = nextSep.search(/[;&|\r\n]/);
-        const seg = cut === -1 ? nextSep : nextSep.slice(0, cut);
-        if (looksLikeShellInvocation(seg, delim)) return true;
+      // 4. Encadenamiento con `;`, `||`, `&&`, `|`, `\n` — v5.3: un único split lineal (antes un slice de 160
+      //    caracteres por separador: 1 MB de ';' eran ~1M copias).
+      const pieces = cand.split(/(&&|\|\||[;|&]|\r?\n)/);
+      for (let s = 1; s + 1 < pieces.length; s += 2) {
+        const sep = pieces[s];
+        if (sep === '&') continue; // un '&' suelto solo corta el segmento (igual que antes)
+        const seg = pieces[s + 1];
+        if (!seg || !seg.trim()) continue;
+        const delim = sep.includes('\n') ? '\n' : sep;
+        if (looksLikeShellInvocation(seg.length > 160 ? seg.slice(0, 160) : seg, delim)) return true;
       }
 
       // 5. Binarios Windows / reverse shells explícitos / Java4Shell
       if (/\bcmd\.exe\s+\/c\b|\bpowershell(?:\.exe)?\s+-(?:enc|encodedcommand|nop)\b/i.test(cand)) return true;
       if (/java4shell|avx512_vbmi_overflow/i.test(cand)) return true;
+      // v5.3: OGNL / Struts2 y expresiones Java de ejecución
+      if (/%\{\s*\(\s*#|\$\{\s*\(\s*#|#_memberAccess|#context\s*\[|@java\.lang\.(?:Runtime|ProcessBuilder|System)@|ognl\.OgnlContext|new\s+java\.lang\.ProcessBuilder|java\.lang\.Runtime\s*\.\s*getRuntime\s*\(/i.test(cand)) {
+        return true;
+      }
+      // v5.3: Deserialización insegura (Java base64/hex, PHP serialize de objetos, .NET BinaryFormatter, node-serialize)
+      if (/(?:^|[^A-Za-z0-9+/])rO0AB[A-Za-z0-9+/=]{12,}|\baced0005[0-9a-f]{8,}|(?:^|[;{"\s])O:\d{1,4}:"[A-Za-z_\\][\w\\]{0,120}":\d{1,4}:\{|_\$\$ND_FUNC\$\$_|\bAAEAAAD\/\/\/\/\/|\$type"\s*:\s*"System\.(?:Windows\.Data\.ObjectDataProvider|Diagnostics\.Process)/i.test(cand)) {
+        return true;
+      }
       if (cand.includes('===') && /(?:^|[^A-Za-z0-9+/])[A-Za-z0-9+/]{120,}={3,}/.test(cand)) return true;
     }
   }
@@ -1130,12 +1472,26 @@ export function analyzeLfiStructure(rawText, { isFreeProseBody = false } = {}) {
   if (/\b(?:php|expect|phar|zip):\/\/(?:filter|input|resource|fd)/i.test(text)) return true;
   if (/\bdata:\/\/[a-z0-9/+.-]*;base64,/i.test(text)) return true;
   if (/\bfile:\/\/\/(?:etc|proc|var|windows|boot)/i.test(text)) return true;
+  // v5.3: wrappers de stream que ningún usuario legítimo escribe (en cualquier contexto)
+  if (/\b(?:phar|expect|glob|compress\.(?:zlib|bzip2)|zlib|rar|ogg|ssh2\.(?:shell|exec|tunnel|sftp|scp)):\/\//i.test(text)) return true;
+  if (/\bphp:\/\/[a-z]/i.test(text)) return true;
 
-  if (/\/etc\/(?:passwd|shadow)\b|\/proc\/(?:self|\d+)\/(?:environ|cmdline|maps|fd)\b|\/var\/www\/[^\s"'<>]*\.(?:env|php|sql|bak|config)\b|c:\\windows\\win\.ini/i.test(text)) {
+  if (/\/etc\/(?:passwd|shadow|group|sudoers|crontab|issue|master\.passwd)\b|\/proc\/(?:self|\d+)\/(?:environ|cmdline|maps|fd|cwd|root|status|mounts)\b|\/var\/www\/[^\s"'<>]*\.(?:env|php|sql|bak|config)\b|c:\\windows\\win\.ini/i.test(text)) {
     return true;
   }
-  if (!isFreeProseBody && /^\/etc\/hosts$/i.test(text.trim())) {
+  // v5.3: rutas de sistema Windows (con \ o /) — en cualquier contexto solo las inequívocamente de sistema
+  if (/\b[a-z]:[\\/]+(?:windows|winnt)[\\/]+(?:system32|syswow64|system\.ini|win\.ini|repair|panther|debug)\b|[\\/]windows[\\/]+system32[\\/]+(?:config|drivers[\\/]+etc)\b|\bboot\.ini\b|[\\/]inetpub[\\/]+wwwroot[\\/][^\s"'<>]*web\.config/i.test(text)) {
     return true;
+  }
+
+  if (!isFreeProseBody) {
+    const trimmed = text.trim();
+    if (/^\/etc\/hosts$/i.test(trimmed)) return true;
+    // Cuando el VALOR COMPLETO de un parámetro es una ruta absoluta de sistema / wrapper de archivo
+    if (/^(?:file:|zip:\/\/|\/(?:etc|proc|root|sys|var\/log|var\/lib|home\/[^/\s]+\/\.(?:ssh|aws|bash_history|config))\/)/i.test(trimmed)) return true;
+    if (/^[a-z]:[\\/]+(?:windows|winnt|programdata|inetpub|boot\.ini|users[\\/]+[^\\/\s]+[\\/]+(?:appdata|ntuser\.dat|\.ssh|\.aws))/i.test(trimmed)) return true;
+    // Rutas UNC hacia otro host (fuga de hash NTLM / SMB relay): \\atacante\share
+    if (/^(?:\\\\|\/\/\/?)[a-z0-9.-]+[\\/][^\s]*/i.test(trimmed) && trimmed.startsWith('\\\\')) return true;
   }
 
   return false;
@@ -1150,7 +1506,7 @@ function hasSstiInDelimitedBlock(inner) {
   // Variable simple de email (`nombre`, `user.first_name`, `order_id`) -> NO es SSTI
   if (/^[a-zA-Z_][a-zA-Z0-9_.-]{0,40}$/.test(s)) return false;
   // Aritmética de prueba (`7*7`, `7*'7'`), introspección Python/JS/Java, imports, llamadas a ejecución
-  return /(?:__class__|__mro__|__subclasses__|__globals__|__builtins__|__import__|constructor|lipsum|cycler|popen|system\s*\(|exec\s*\(|eval\s*\(|Runtime|ProcessBuilder|request\.application|config\.items|\bimport\s+os\b|\d+\s*[*+-/]\s*(?:'\d+'|\d+))/i.test(
+  return /(?:__class__|__mro__|__subclasses__|__globals__|__builtins__|__import__|__init__|__self|_self\.env|registerUndefinedFilterCallback|getFilter\s*\(|_TemplateReference__context|\|\s*attr\s*\(|\|\s*map\s*\(\s*["']system|constructor|lipsum|cycler|joiner|namespace\.__|popen|system\s*\(|exec\s*\(|eval\s*\(|Runtime|ProcessBuilder|request\.application|request\[|config\.items|self\.__|\bimport\s+os\b|\d+\s*[*+-/]\s*(?:'\d+'|"\d+"|\d+))/i.test(
     s
   );
 }
@@ -1182,8 +1538,19 @@ export function analyzeExtrasStructure({ rawTexts = [], jsonKeys = [], jsonKeyPa
 
   for (const p of params) {
     const k = String(p.key || '');
-    if (/\[\s*\$(?:ne|eq|gt|gte|lt|lte|in|nin|where|regex|exists|or|and)\s*\]/i.test(k)) return true;
-    if (/(?:^|[\[.])__proto__(?:[\].]|$)|constructor(?:\.|\[)prototype/i.test(k)) return true;
+    if (/\[\s*\$(?:ne|eq|gt|gte|lt|lte|in|nin|where|regex|exists|or|and|expr|function|elemMatch|not|nor)\s*\]/i.test(k)) return true;
+    // v5.3: __proto__ seguido de '[' (query `__proto__[isAdmin]=true`) — antes solo ']' o '.'
+    if (/(?:^|[\[.])__proto__(?:[\[\].]|$)|constructor\s*(?:\.|\[)\s*prototype/i.test(k)) return true;
+    // v5.3: binding de objetos Java (Spring4Shell CVE-2022-22965 y familia): class.module.classLoader / class[classLoader]
+    if (/(?:^|[.\[])class\s*(?:\.|\[)\s*(?:module|classloader|protectiondomain)\b|(?:^|[.\[])classloader\s*(?:\.|\[)/i.test(k)) return true;
+    // v5.3: CRLF / división de cabeceras en valores de query/ruta/cabecera (no en prosa de body)
+    if ((p.source === 'query' || p.source === 'path') && /[\r\n]\s*(?:set-cookie|location|content-(?:type|length|security-policy)|refresh|access-control-[a-z-]+|x-[a-z-]{2,40}|transfer-encoding|http\/1\.[01])\s*:?/i.test(String(p.value || ''))) {
+      return true;
+    }
+    // v5.3: LDAP injection: cierre de filtro + nuevo filtro  `*)(uid=*))(|(uid=*`, `admin)(&)`
+    if (/\)\s*\(\s*[|&!]\s*\(?\s*[a-z][\w-]{0,30}\s*[~<>]?=|\*\)\s*\(\s*[a-z][\w-]{0,30}\s*=\s*\*|\)\s*\(\s*&\s*\)|\)\s*\(\s*\|\s*\(/i.test(String(p.value || ''))) {
+      return true;
+    }
   }
 
   // 2. SSTI (con y sin {{ }}), XXE real (sin FP en <!DOCTYPE html PUBLIC XHTML>) y Prototype Pollution

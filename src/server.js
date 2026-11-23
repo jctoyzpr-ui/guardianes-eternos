@@ -1,5 +1,5 @@
 /**
- * @fileoverview Servidor HTTP Nativo de Guardianes Eternos v5.2 (Deception-First Dual-Plane).
+ * @fileoverview Servidor HTTP Nativo de Guardianes Eternos v5.3 (Deception-First Dual-Plane).
  * - Fase 0 (#1): Activos estáticos exentos del rate-limit; ráfagas solo devuelven 429 temporal (sin cuarentena).
  * - Fase 0 (#2): Inspección lineal O(n) en Worker Thread dedicado con tope de tiempo (50 ms);
  *   sin descompresión ni inspección de bodies grandes (> 64 KB) por defecto (inmune a DoS de CPU / gzip-bomb).
@@ -14,7 +14,6 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
-import zlib from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,8 +22,7 @@ import { SwarmMemory } from './engine/swarmMemory.js';
 import { SQLiteStore } from './engine/sqliteStore.js';
 import {
   CANARY_PATHS,
-  DEFAULT_WAF_RULES,
-  decodeBufferToInspectableText
+  DEFAULT_WAF_RULES
 } from './engine/sentinelWaf.js';
 import { SearchBotVerifier } from './engine/botVerifier.js';
 import { DpiWorkerRunner } from './engine/dpiRunner.js';
@@ -48,7 +46,6 @@ const DEFAULT_MEMORY_FILE = path.resolve(ROOT_DIR, 'MEMORIA_PROYECTO.md');
 const DEFAULT_DB_FILE = path.resolve(ROOT_DIR, 'data/guardianes.sqlite');
 
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
-const MAX_INSPECT_BODY_BYTES = 64 * 1024; // Fase 0 (#2): Tope acotado por defecto (64 KB) sin congelar CPU
 const MAX_PROXY_BODY_BYTES = 20 * 1024 * 1024;
 const DEFAULT_TRUSTED_PROXIES = ['127.0.0.1', '::1'];
 const LOGIN_MAX_FAILURES = 5;
@@ -141,49 +138,6 @@ async function readJsonBody(req) {
   } catch {
     throw new Error('Invalid JSON body');
   }
-}
-
-/**
- * Fase 0 (#2) & Fase 1 (#6):
- * - No descomprime ni inspecciona bodies grandes por defecto (inmune a gzip-bombs y DoS de CPU).
- * - Cuando inspecciona (hasta `maxBytes = 64 KB`), NO confía en el Content-Type declarado:
- *   usa magic bytes reales y decodifica UTF-16LE / UTF-16BE / UTF-8.
- */
-function extractInspectableBodyText(
-  rawBodyBuffer,
-  contentType = '',
-  contentEncoding = '',
-  { decompressForInspection = false, maxBytes = MAX_INSPECT_BODY_BYTES } = {}
-) {
-  if (!rawBodyBuffer || rawBodyBuffer.length === 0) return '';
-
-  const ce = String(contentEncoding || '').toLowerCase().trim();
-  let targetBuf = rawBodyBuffer;
-
-  if (ce && ce !== 'identity') {
-    // Fase 0 (#2): Por defecto NO descomprimir cuerpos comprimidos para evitar CPU DoS por gzip-bomb
-    if (!decompressForInspection) return '';
-    try {
-      if (ce.includes('gzip')) {
-        targetBuf = zlib.gunzipSync(rawBodyBuffer, { maxOutputLength: maxBytes });
-      } else if (ce.includes('deflate')) {
-        targetBuf = zlib.inflateSync(rawBodyBuffer, { maxOutputLength: maxBytes });
-      } else if (ce.includes('br')) {
-        targetBuf = zlib.brotliDecompressSync(rawBodyBuffer, { maxOutputLength: maxBytes });
-      } else {
-        return '';
-      }
-    } catch {
-      // Si excede 64 KB descomprimidos o está malformado, omitir inspección (no bloquear ni consumir CPU)
-      return '';
-    }
-  } else if (rawBodyBuffer.length > maxBytes) {
-    // Fase 0 (#2): No inspeccionar bodies grandes por defecto; se reenvían tal cual al backend
-    return '';
-  }
-
-  // Fase 1 (#6): Inspección basada en magic bytes + UTF-16LE/BE independientemente del Content-Type declarado
-  return decodeBufferToInspectableText(targetBuf, contentType, maxBytes);
 }
 
 export function resolveClientIdentity(req, trustProxyHeaders = false, trustedProxies = DEFAULT_TRUSTED_PROXIES) {
@@ -319,7 +273,7 @@ function proxyToProtectedTarget({
           if (v !== undefined) resHeaders[k] = v;
         }
 
-        resHeaders['X-Protected-By'] = 'Guardianes-Eternos-Deception/5.2';
+        resHeaders['X-Protected-By'] = 'Guardianes-Eternos-Deception/5.3';
         resHeaders['X-Content-Type-Options'] = resHeaders['x-content-type-options'] || 'nosniff';
         resHeaders['X-Frame-Options'] = resHeaders['x-frame-options'] || 'SAMEORIGIN';
         resHeaders['Referrer-Policy'] = resHeaders['referrer-policy'] || 'strict-origin-when-cross-origin';
@@ -597,6 +551,8 @@ export function createGuardianesServer(options = {}) {
       override.injectDomCanary !== undefined
         ? Boolean(override.injectDomCanary)
         : Boolean(savedShield?.injectDomCanary ?? false),
+    // v5.3: obsoleto (se conserva por compatibilidad de configuración). La descompresión acotada SIEMPRE ocurre
+    // dentro del worker; ya no existe la opción de reenviar cuerpos comprimidos sin inspeccionar.
     decompressForInspection:
       override.decompressForInspection !== undefined
         ? Boolean(override.decompressForInspection)
@@ -659,6 +615,13 @@ export function createGuardianesServer(options = {}) {
           if (patch.wafRules.wafActionMode === 'detect' || patch.wafRules.wafActionMode === 'block-request') {
             shieldConfig.wafRules.wafActionMode = patch.wafRules.wafActionMode;
           }
+        } else if (key === 'uninspectablePolicy') {
+          if (['auto', 'block', 'allow-with-alert'].includes(patch.wafRules.uninspectablePolicy)) {
+            shieldConfig.wafRules.uninspectablePolicy = patch.wafRules.uninspectablePolicy;
+          }
+        } else if (key === 'maxInspectBodyKb') {
+          const kb = Number(patch.wafRules.maxInspectBodyKb);
+          if (Number.isFinite(kb) && kb >= 16 && kb <= 8192) shieldConfig.wafRules.maxInspectBodyKb = Math.floor(kb);
         } else if (typeof DEFAULT_WAF_RULES[key] === 'boolean') {
           shieldConfig.wafRules[key] = Boolean(patch.wafRules[key]);
         } else {
@@ -713,7 +676,8 @@ export function createGuardianesServer(options = {}) {
   const dpiRunner =
     options.dpiRunner ||
     new DpiWorkerRunner({
-      timeoutMs: options.dpiTimeoutMs ?? 50,
+      timeoutMs: options.dpiTimeoutMs ?? 1000,
+      ...(options.dpiPoolSize ? { poolSize: options.dpiPoolSize } : {}),
       useWorker: options.useDpiWorker !== false
     });
   const memory = new SwarmMemory(memoryFilePath, store);
@@ -807,7 +771,7 @@ export function createGuardianesServer(options = {}) {
       from: 'CHRONICLER',
       to: 'SWARM',
       severity: 'SUCCESS',
-      modelUsed: 'deterministic-local:cyber-range-v5.2',
+      modelUsed: 'deterministic-local:cyber-range-v5.3',
       message:
         `Campo de Tiro Real completado: Sin escudo = ${cyberRange.round1Summary.breachesSucceeded}/${cyberRange.round1Summary.totalAttacks} brechas. ` +
         `Con Guardianes Eternos = ${cyberRange.round2Summary.trappedByGuardianes}/${cyberRange.round2Summary.totalAttacks} ataques detenidos, ` +
@@ -820,7 +784,7 @@ export function createGuardianesServer(options = {}) {
           ip: r.id === 'artex-ip-spoof' ? '185.220.101.47' : '198.51.100.210',
           path: r.payload.split('?')[0],
           rawUrl: r.payload,
-          userAgent: 'RedTeam-CyberRange/5.2',
+          userAgent: 'RedTeam-CyberRange/5.3',
           headers: {},
           query: {}
         },
@@ -846,9 +810,9 @@ export function createGuardianesServer(options = {}) {
       from: 'CHRONICLER',
       to: 'SWARM',
       severity: 'INFO',
-      modelUsed: 'deterministic-local:boot-v5.2',
+      modelUsed: 'deterministic-local:boot-v5.3',
       message:
-        `Guardianes Eternos v5.2 Deception-First activo (${store.isMemory ? 'SQLite memoria' : 'SQLite disco'}). ` +
+        `Guardianes Eternos v5.3 Deception-First activo (${store.isMemory ? 'SQLite memoria' : 'SQLite disco'}). ` +
         `Canarios, laberinto Tarpit y telemetría estructural en Worker protegiendo ${shieldConfig.protectedTargetUrl}.`
     });
   }
@@ -1023,16 +987,8 @@ export function createGuardianesServer(options = {}) {
         rawBodyBuffer = await readBodyBuffer(req, MAX_PROXY_BODY_BYTES);
       }
 
-      const dpiBodyText = extractInspectableBodyText(
-        rawBodyBuffer,
-        req.headers['content-type'],
-        req.headers['content-encoding'],
-        {
-          decompressForInspection: shieldConfig.decompressForInspection,
-          maxBytes: MAX_INSPECT_BODY_BYTES
-        }
-      );
-
+      // v5.3: el cuerpo crudo viaja al Worker, que descomprime (gzip/deflate/br, con tope), valida charset,
+      // recorre multipart a nivel de bytes e inspecciona. El hilo principal no toca el contenido.
       const defenseOutcome = await swarm.handleIncomingRequest({
         ip,
         socketIp,
@@ -1042,8 +998,9 @@ export function createGuardianesServer(options = {}) {
         userAgent,
         headers: req.headers,
         query,
-        bodyText: dpiBodyText,
-        contentType: String(req.headers['content-type'] || '')
+        rawBody: rawBodyBuffer.length > 0 ? rawBodyBuffer : null,
+        contentType: String(req.headers['content-type'] || ''),
+        contentEncoding: String(req.headers['content-encoding'] || '')
       });
 
       if (defenseOutcome.intercepted) {
@@ -1058,15 +1015,21 @@ export function createGuardianesServer(options = {}) {
           return;
         }
 
-        // Modo opt-in `block-request`: 403 puntual sin cuarentena
+        // Modo opt-in `block-request`: rechazo puntual sin cuarentena (403 ataque; 413/415/400/503 no inspeccionable)
         if (defenseOutcome.responseMode === 'REQUEST_BLOCK_ONLY') {
+          const status = defenseOutcome.httpStatus || 403;
           sendJson(
             res,
-            403,
-            { error: 'Request blocked by structural inspection.', blocked: true, quarantined: false },
+            status,
+            {
+              error: status === 403 ? 'Request blocked by structural inspection.' : 'Request could not be safely inspected.',
+              blocked: true,
+              quarantined: false
+            },
             {
               'X-Guardianes-Blocked': 'true',
-              'X-Guardianes-Vectors': (defenseOutcome.inspection?.attackVectors || []).join(',')
+              'X-Guardianes-Vectors': (defenseOutcome.inspection?.attackVectors || []).join(','),
+              ...(status === 503 ? { 'Retry-After': '2' } : {})
             }
           );
           return;
@@ -1094,7 +1057,7 @@ export function createGuardianesServer(options = {}) {
 
       sendJson(res, 200, {
         status: 'ok',
-        perimeter: 'Guardianes Eternos Data Plane v5.2',
+        perimeter: 'Guardianes Eternos Data Plane v5.3',
         protected: true
       });
     } catch (err) {
@@ -1411,7 +1374,7 @@ export function createGuardianesServer(options = {}) {
           from: 'CHRONICLER',
           to: 'SWARM',
           severity: 'INFO',
-          modelUsed: 'deterministic-local:config-v5.2',
+          modelUsed: 'deterministic-local:config-v5.3',
           message: `Motores de IA guardados en SQLite: modo "${updated.mode.toUpperCase()}", límite ${updated.maxApiCallsPerHour} API/h, Tarpit ${updated.tarpitDelayMs} ms.`
         });
         sendJson(res, 200, {
@@ -1429,7 +1392,7 @@ export function createGuardianesServer(options = {}) {
           from: 'SENTINEL',
           to: 'SWARM',
           severity: 'INFO',
-          modelUsed: 'deterministic-local:config-v5.2',
+          modelUsed: 'deterministic-local:config-v5.3',
           message: `Escudo actualizado: objetivo ${updatedShield.protectedTargetUrl} (${updatedShield.shieldMode}, heurísticas=${updatedShield.wafRules.wafActionMode}).`
         });
         sendJson(res, 200, {
@@ -1454,7 +1417,7 @@ export function createGuardianesServer(options = {}) {
           from: 'SENTINEL',
           to: 'SWARM',
           severity: quarantined ? 'CRITICAL' : 'INFO',
-          modelUsed: 'deterministic-local:quarantine-v5.2',
+          modelUsed: 'deterministic-local:quarantine-v5.3',
           message: quarantined
             ? `Operador activó CUARENTENA manual para ${target}.`
             : `Operador liberó de cuarentena a ${target}.`
@@ -1558,7 +1521,7 @@ export function createGuardianesServer(options = {}) {
           from: 'CHRONICLER',
           to: 'SWARM',
           severity: 'INFO',
-          modelUsed: 'deterministic-local:reset-v5.2',
+          modelUsed: 'deterministic-local:reset-v5.3',
           message: 'Sesión y base SQLite de amenazas limpiadas. 43+ canarios y telemetría estructural listos.'
         });
         sendJson(res, 200, {
@@ -1678,11 +1641,11 @@ if (isDirectExecution) {
   const { dataServer, controlServer, generatedAdminToken } = createGuardianesServer();
 
   dataServer.listen(dataPort, dataHost, () => {
-    console.log(`🛡️  Guardianes Eternos v5.2 [DATA PLANE]    activo en http://${dataHost}:${dataPort}`);
+    console.log(`🛡️  Guardianes Eternos v5.3 [DATA PLANE]    activo en http://${dataHost}:${dataPort}`);
   });
 
   controlServer.listen(controlPort, controlHost, () => {
-    console.log(`🎛️  Guardianes Eternos v5.2 [CONTROL PLANE] activo en http://${controlHost}:${controlPort}`);
+    console.log(`🎛️  Guardianes Eternos v5.3 [CONTROL PLANE] activo en http://${controlHost}:${controlPort}`);
     if (generatedAdminToken) {
       console.log('🔑  [PRIMER ARRANQUE] Admin Token generado (guárdalo ahora, solo se muestra una vez):');
       console.log(`    GUARDIANES_ADMIN_TOKEN=${generatedAdminToken}`);

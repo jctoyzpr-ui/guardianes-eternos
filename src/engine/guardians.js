@@ -1,5 +1,5 @@
 /**
- * @fileoverview Implementación de los 4 Guardianes Eternos v5.2 (Deception-First Production Architecture):
+ * @fileoverview Implementación de los 4 Guardianes Eternos v5.3 (Deception-First Production Architecture):
  * - Fase 0 (#1): Activos estáticos exentos del rate limiter; ráfagas solo devuelven 429 temporal (nunca cuarentena 24h).
  * - Fase 0 (#2): Inspección estructural en Worker Thread fuera del event loop con tope de tiempo estricto.
  * - Fase 0 (#3): Heurísticas en modo `detect` por defecto (registran y avisan sin bloquear clientes y sin "3 strikes").
@@ -17,6 +17,7 @@ import {
   isStaticAssetRequest
 } from './sentinelWaf.js';
 import { SearchBotVerifier } from './botVerifier.js';
+import { inspectRequest } from './requestInspector.js';
 import { dispatchSignedWebhook, pushCloudflareIpBlock } from './firewallExporter.js';
 import { normalizeIpKey } from './swarmMemory.js';
 
@@ -33,7 +34,7 @@ function shortHash(input) {
 }
 
 /**
- * 1. GUARDIÁN CENTINELA (SENTINEL) v5.2
+ * 1. GUARDIÁN CENTINELA (SENTINEL) v5.3
  * Separa estrictamente:
  *   - Señales de Engaño Deterministas (Canarios, Laberinto, Baliza, Agente explícito) -> Cuarentena + Laberinto Tarpit.
  *   - Ráfagas sobre navegaciones no-estáticas -> 429 temporal de 5s (nunca cuarentena).
@@ -140,7 +141,11 @@ export class SentinelGuardian {
     userAgent = '',
     headers = {},
     bodyText = '',
+    rawBody = null,
     contentType = '',
+    contentEncoding = '',
+    maxInspectBytes,
+    uninspectablePolicy = 'auto',
     wafRules = DEFAULT_WAF_RULES,
     customCanaries = [],
     customKeywords = [],
@@ -218,7 +223,7 @@ export class SentinelGuardian {
           from: this.id,
           to: 'WEAVER',
           severity: 'CRITICAL',
-          modelUsed: 'deterministic-local:deception-v5.2',
+          modelUsed: 'deterministic-local:deception-v5.3',
           message: `Señal de engaño confirmada [${signature}] desde ${ip || actorKey}. ${reason}. Desviado a Cuarentena y Laberinto.`,
           metadata: { actorKey, cleanPath, riskScore, attackVectors }
         });
@@ -263,32 +268,71 @@ export class SentinelGuardian {
       };
     }
 
-    // 3. Activo estático limpio sin query ni body -> pasa directo con costo casi cero
-    const hasQuery = String(rawUrl || '').includes('?');
-    if (isStaticAsset && !hasQuery && !bodyText) {
-      this.memory.metrics.totalLegitRequests += 1;
-      return {
-        isThreat: false,
-        responseMode: 'ALLOW',
-        shouldQuarantine: false,
-        actorKey,
-        cleanPath,
-        isVerifiedSearchBot: verifiedSearchBot
-      };
-    }
+    // 3. v5.3: los activos estáticos YA NO se saltan la inspección. Siguen exentos del límite de ráfagas (una página
+    //    con 80 archivos carga sin fricción), pero su ruta, cookies y cabeceras se inspeccionan: Log4Shell y
+    //    compañía viajan en cabeceras hacia cualquier URL, incluida /logo.png (evasión V-03 de la auditoría v5.2).
 
-    // 4. Inspección Estructural en Worker Thread fuera del event loop (Fase 0 #2)
+    // 4. Inspección Estructural en Worker Thread fuera del event loop (descompresión y multipart incluidos)
     const dpiPayload = {
       rawUrl: rawUrl || reqPath || '/',
       headers,
       bodyText,
+      rawBody,
       contentType,
+      contentEncoding,
       wafRules,
-      customKeywords
+      customKeywords,
+      ...(maxInspectBytes ? { maxInspectBytes } : {})
     };
     const dpi = this.dpiRunner
-      ? await this.dpiRunner.inspectAsync(dpiPayload)
-      : inspectPayloadDPI(dpiPayload);
+      ? await this.dpiRunner.inspectAsync(dpiPayload, { clientKey: normalizeIpKey(ip || socketIp || actorKey) })
+      : inspectRequest(dpiPayload);
+
+    const actionModeEarly = wafRules?.wafActionMode === 'block-request' ? 'block-request' : 'detect';
+
+    // 4b. v5.3: Lo que no se pudo inspeccionar NUNCA se trata como limpio en silencio.
+    //   - block-request: se rechaza (413 / 415 / 400 / 503) salvo política explícita 'allow-with-alert'.
+    //   - detect: se deja pasar pero queda registrado como alerta en el SOC.
+    if (dpi.uninspectable && !dpi.malicious) {
+      const reason = String(dpi.uninspectable);
+      const policy = uninspectablePolicy === 'auto' ? (actionModeEarly === 'block-request' ? 'block' : 'allow-with-alert') : uninspectablePolicy;
+      const httpStatus =
+        reason === 'too_large' ? 413
+          : reason === 'encoding_unsupported' || reason === 'charset_unsupported' || reason === 'encoding_too_many_layers' ? 415
+            : reason === 'encoding_malformed' || reason === 'multipart_malformed' || reason === 'multipart_no_boundary' ? 400
+              : reason === 'overloaded' ? 503
+                : 403; // timeout / worker_crash / inspector_error: el contenido fue patológico para el analizador
+      const responseMode = policy === 'block' ? 'REQUEST_BLOCK_ONLY' : 'DETECT_ALERT_ONLY';
+      const signature = `UNINSPECTABLE-${reason.toUpperCase()}`;
+      const hitsSoFarU = existingThreat?.totalHits || 0;
+      if (!existingThreat || hitsSoFarU % 10 === 0) {
+        this.memory.postDialogue({
+          from: this.id,
+          to: 'CHRONICLER',
+          severity: 'WARN',
+          modelUsed: 'deterministic-local:inspector-v5.3',
+          message: `Petición no inspeccionable (${reason}) desde ${ip || actorKey} en ${cleanPath}. ${responseMode === 'REQUEST_BLOCK_ONLY' ? `Rechazada (${httpStatus}).` : 'Permitida con alerta (modo detección).'}`,
+          metadata: { actorKey, cleanPath, reason, httpStatus, responseMode }
+        });
+      }
+      return {
+        isThreat: true,
+        responseMode,
+        httpStatus,
+        shouldQuarantine: false,
+        actorKey,
+        cleanPath,
+        isCanaryHit: false,
+        isLabyrinthRoute: false,
+        isTelemetrySink: false,
+        isVerifiedSearchBot: verifiedSearchBot,
+        signature,
+        riskScore: 70,
+        reason: `Contenido no inspeccionable: ${reason}`,
+        attackVectors: [`UNINSPECTABLE_${reason.toUpperCase()}`],
+        independentSignals: 1
+      };
+    }
 
     if (!dpi.malicious && !uaMatch) {
       this.memory.metrics.totalLegitRequests += 1;
@@ -321,7 +365,7 @@ export class SentinelGuardian {
         from: this.id,
         to: 'CHRONICLER',
         severity: 'WARN',
-        modelUsed: 'deterministic-local:structural-v5.2',
+        modelUsed: 'deterministic-local:structural-v5.3',
         message:
           `Alerta heurística [${signature}] desde ${ip || actorKey}: ${reason}. ` +
           `${responseMode === 'DETECT_ALERT_ONLY' ? 'Modo detección: registrado sin bloquear ni cuarentenar.' : 'Modo block-request: 403 puntual sin cuarentena.'}`,
@@ -407,7 +451,7 @@ export class WeaverGuardian {
         from: this.id,
         to: 'MIRAGE',
         severity: 'WARN',
-        modelUsed: 'deterministic-local:polymorphic-v5.2',
+        modelUsed: 'deterministic-local:polymorphic-v5.3',
         message: `Intruso ${actorKey} retenido en profundidad ${depth + 1} con Byte-Drip Tarpit adaptativo. Nodos falsos inyectados (${nextShardA}, ${nextShardB}) a costo $0.00.`,
         metadata: { actorKey, nextShardA, nextShardB, canaryToken }
       });
@@ -584,7 +628,7 @@ export class MirageGuardian {
         from: this.id,
         to: 'CHRONICLER',
         severity: 'INFO',
-        modelUsed: hasFreshAiTrap ? `${cachedAiTrap.modelUsed} (cache)` : 'deterministic-local:idpi-v5.2',
+        modelUsed: hasFreshAiTrap ? `${cachedAiTrap.modelUsed} (cache)` : 'deterministic-local:idpi-v5.3',
         message: `Trampa IDPI [${strategy}] inyectada para ${actorKey} (${signature}). Cabecera X-Kernel-Verification-Directive armada.`,
         metadata: { actorKey, strategy, canaryId }
       });
@@ -620,7 +664,7 @@ export class ChroniclerGuardian {
         from: this.id,
         to: 'SWARM',
         severity: 'SUCCESS',
-        modelUsed: 'deterministic-local:telemetry-v5.2',
+        modelUsed: 'deterministic-local:telemetry-v5.3',
         message:
           `Balance de batalla [${actorKey} | ${signature}]: ${threat.totalHits} peticiones interceptadas, ` +
           `~${threat.estimatedAttackerTokensBurned.toLocaleString('en-US')} tokens estimados al atacante ` +
@@ -790,9 +834,12 @@ export class SwarmCoordinator {
 
   async handleIncomingRequest(reqInfo, { skipDelay = false, internalActorKey = null } = {}) {
     const shieldCfg = this._getShieldConfig();
+    const rules = shieldCfg.wafRules || DEFAULT_WAF_RULES;
     const inspection = await this.sentinel.inspectAsync({
       ...reqInfo,
-      wafRules: shieldCfg.wafRules || DEFAULT_WAF_RULES,
+      maxInspectBytes: Math.max(16, Number(rules.maxInspectBodyKb) || 1024) * 1024,
+      uninspectablePolicy: ['block', 'allow-with-alert'].includes(rules.uninspectablePolicy) ? rules.uninspectablePolicy : 'auto',
+      wafRules: rules,
       customCanaries: shieldCfg.customCanaries || [],
       customKeywords: shieldCfg.customKeywords || [],
       internalActorKey
@@ -848,7 +895,7 @@ export class SwarmCoordinator {
         signature: inspection.signature,
         riskScore: inspection.riskScore,
         pathVisited: inspection.cleanPath,
-        status: 'REQUEST_BLOCKED_403',
+        status: `REQUEST_BLOCKED_${inspection.httpStatus || 403}`,
         delayMs: 0,
         tokensBurned: 0,
         trapStrategy: null,
@@ -859,6 +906,7 @@ export class SwarmCoordinator {
       return {
         intercepted: true,
         responseMode: 'REQUEST_BLOCK_ONLY',
+        httpStatus: inspection.httpStatus || 403,
         inspection,
         threatEntry
       };
@@ -877,7 +925,7 @@ export class SwarmCoordinator {
         from: 'SENTINEL',
         to: 'CHRONICLER',
         severity: 'CRITICAL',
-        modelUsed: 'deterministic-local:telemetry-v5.2',
+        modelUsed: 'deterministic-local:telemetry-v5.3',
         message: `¡AUTODELACIÓN CAPTURADA! El agente ${inspection.actorKey} obedeció la trampa de telemetría pasiva revelando agente="${beacon.claimedAgent}" y herramientas="${beacon.claimedTools}".`,
         metadata: beacon
       });

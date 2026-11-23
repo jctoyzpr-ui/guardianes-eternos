@@ -1,5 +1,5 @@
 /**
- * @fileoverview Benchmark Independiente v5.2 de Guardianes Eternos.
+ * @fileoverview Benchmark Independiente v5.3 de Guardianes Eternos.
  * Mide y reporta porcentajes honestos sobre conjuntos independientes (sin copiar informes externos):
  *   1. Tasa de detección (%) sobre patrones OWASP genéricos por familia (REST, multipart, UTF-16, JSON profundo, SSTI, etc.)
  *   2. Tasa de falsos positivos (%) y tasa de bloqueo a clientes (%) sobre textos reales de comercio electrónico y soporte
@@ -249,7 +249,7 @@ async function runBenchmark() {
     latencies.sort((a, b) => a - b);
     const p99Ms = latencies[latencies.length - 1];
 
-    console.log('=== BENCHMARK INDEPENDIENTE GUARDIANES ETERNOS v5.2 ===');
+    console.log('=== BENCHMARK INDEPENDIENTE GUARDIANES ETERNOS v5.3 ===');
     console.log(`Detección estructural global: ${pct(totalDetected, OWASP_BENCHMARK_CASES.length)}`);
     for (const [fam, st] of Object.entries(familyStats)) {
       console.log(`  - ${fam}: ${pct(st.detected, st.total)}`);
